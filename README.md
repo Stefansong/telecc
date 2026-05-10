@@ -30,7 +30,7 @@ See [CHANGELOG.md](CHANGELOG.md) for the upstream version history this fork is b
 The new binary and home dir are renamed (`ccgram` → `telecc`, `~/.ccgram` → `~/.telecc`):
 
 ```bash
-git clone https://github.com/stefan-song/telecc.git
+git clone https://github.com/Stefansong/telecc.git
 cd telecc
 npm install
 npm run build

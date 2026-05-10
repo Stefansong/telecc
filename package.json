@@ -57,12 +57,12 @@
   ],
   "repository": {
     "type": "git",
-    "url": "git+ssh://git@github.com/stefan-song/telecc.git"
+    "url": "git+ssh://git@github.com/Stefansong/telecc.git"
   },
   "bugs": {
-    "url": "https://github.com/stefan-song/telecc/issues"
+    "url": "https://github.com/Stefansong/telecc/issues"
   },
-  "homepage": "https://github.com/stefan-song/telecc",
+  "homepage": "https://github.com/Stefansong/telecc",
   "dependencies": {
     "dotenv": "^17.2.1"
   },
