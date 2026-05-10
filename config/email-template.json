@@ -1,0 +1,31 @@
+{
+  "email": {
+    "type": "email",
+    "enabled": true,
+    "config": {
+      "smtp": {
+        "host": "smtp.gmail.com",
+        "port": 587,
+        "secure": false,
+        "auth": {
+          "user": "your-email@gmail.com",
+          "pass": "your-app-password"
+        }
+      },
+      "imap": {
+        "host": "imap.gmail.com",
+        "port": 993,
+        "secure": true,
+        "auth": {
+          "user": "your-email@gmail.com",
+          "pass": "your-app-password"
+        }
+      },
+      "from": "urocc <your-email@gmail.com>",
+      "to": "your-email@gmail.com",
+      "template": {
+        "checkInterval": 30
+      }
+    }
+  }
+}

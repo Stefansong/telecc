@@ -1,0 +1,24 @@
+# urocc systemd unit file
+# Copy to /etc/systemd/system/urocc.service and edit paths, then:
+#   sudo systemctl daemon-reload
+#   sudo systemctl enable urocc
+#   sudo systemctl start urocc
+
+[Unit]
+Description=urocc - Claude Code Telegram Bot
+After=network.target
+
+[Service]
+Type=simple
+User=YOUR_USERNAME
+WorkingDirectory=/home/YOUR_USERNAME/tools/urocc
+ExecStart=/usr/bin/node dist/workspace-telegram-bot.js
+Restart=always
+RestartSec=5
+Environment=NODE_ENV=production
+
+StandardOutput=append:/home/YOUR_USERNAME/tools/urocc/logs/bot-stdout.log
+StandardError=append:/home/YOUR_USERNAME/tools/urocc/logs/bot-stderr.log
+
+[Install]
+WantedBy=multi-user.target

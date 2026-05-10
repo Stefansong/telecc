@@ -1,0 +1,419 @@
+#!/usr/bin/env node
+
+/**
+ * Enhanced Hook Notifier — called by Claude Code hooks.
+ *
+ * Handles: Stop (completed), Notification (waiting), SessionStart,
+ *          SessionEnd, SubagentStop (subagent-done), StopFailure (stop-failure),
+ *          PostCompact (post-compact), TaskCreated (task-created),
+ *          CwdChanged (cwd-changed), InstructionsLoaded (instructions-loaded).
+ *
+ * Usage (in ~/.claude/settings.json hooks):
+ *   node /path/to/urocc/dist/enhanced-hook-notify.js completed
+ *   node /path/to/urocc/dist/enhanced-hook-notify.js waiting
+ *   node /path/to/urocc/dist/enhanced-hook-notify.js session-start
+ *   node /path/to/urocc/dist/enhanced-hook-notify.js session-end
+ *   node /path/to/urocc/dist/enhanced-hook-notify.js subagent-done
+ *   node /path/to/urocc/dist/enhanced-hook-notify.js stop-failure
+ *   node /path/to/urocc/dist/enhanced-hook-notify.js post-compact
+ *   node /path/to/urocc/dist/enhanced-hook-notify.js task-created
+ *   node /path/to/urocc/dist/enhanced-hook-notify.js cwd-changed
+ *   node /path/to/urocc/dist/enhanced-hook-notify.js instructions-loaded
+ */
+
+import fs from 'fs';
+import path from 'path';
+import { PROJECT_ROOT } from './src/utils/paths';
+require('dotenv').config({ path: path.join(PROJECT_ROOT, '.env'), quiet: true });
+
+import https from 'https';
+import Logger from './src/core/logger';
+import { upsertSession, extractWorkspaceName, trackNotificationMessage, updateSessionRateLimit } from './workspace-router';
+import type { RateLimitInfo } from './src/types';
+import { hasPendingForWorkspace } from './prompt-bridge';
+import { isUserActiveAtTerminal } from './src/utils/active-check';
+import type { TelegramMessage } from './src/types';
+
+const logger = new Logger('hook:enhanced');
+
+const BOT_TOKEN = process.env.TELEGRAM_BOT_TOKEN;
+const CHAT_ID = process.env.TELEGRAM_CHAT_ID;
+const TELEGRAM_ENABLED = process.env.TELEGRAM_ENABLED === 'true';
+
+const STATUS_ARG = process.argv[2] || 'completed';
+
+// ── Status configuration ─────────────────────────────────────────
+
+interface StatusConfig {
+  icon: string;
+  label: string;
+  /** When true, notification fires even if user is active at terminal */
+  alwaysNotify: boolean;
+  /** When true, register/update the session map entry */
+  upsertSession: boolean;
+}
+
+const STATUS_CONFIG: Record<string, StatusConfig> = {
+  'completed':     { icon: '\u2705', label: 'Task completed',       alwaysNotify: false, upsertSession: true  },
+  'waiting':       { icon: '\u23f3', label: 'Waiting for input',    alwaysNotify: false, upsertSession: true  },
+  'session-start': { icon: '\u{1F7E2}', label: 'Session started',   alwaysNotify: false, upsertSession: true  },
+  'session-end':   { icon: '\u{1F534}', label: 'Session ended',     alwaysNotify: false, upsertSession: false },
+  'subagent-done': { icon: '\u{1F916}', label: 'Subagent finished', alwaysNotify: false, upsertSession: true  },
+  // Phase 2 hook events
+  'stop-failure':        { icon: '\u26A0\uFE0F', label: 'API error',           alwaysNotify: true,  upsertSession: true  },
+  'post-compact':        { icon: '\u{1F4E6}', label: 'Context compacted',      alwaysNotify: false, upsertSession: true  },
+  'task-created':        { icon: '\u{1F4CB}', label: 'Task created',           alwaysNotify: false, upsertSession: true  },
+  'cwd-changed':         { icon: '\u{1F4C2}', label: 'Directory changed',      alwaysNotify: false, upsertSession: true  },
+  'instructions-loaded': { icon: '\u{1F4D6}', label: 'Instructions loaded',    alwaysNotify: false, upsertSession: false },
+};
+
+// ── Main ────────────────────────────────────────────────────────
+
+async function main(): Promise<void> {
+  let payload: Record<string, unknown>;
+  try {
+    const raw = await readStdin();
+    payload = JSON.parse(raw);
+  } catch {
+    payload = {};
+  }
+
+  const cwd = (payload.cwd as string) || process.env.CLAUDE_CWD || process.cwd();
+  const workspace = extractWorkspaceName(cwd)!;
+  const sessionTitle = (payload.session_title as string) || null; // v2.1.94+
+  const tmuxSession = detectSessionName(cwd);
+  const sessionId = (payload.session_id as string) || null;
+
+  const config = STATUS_CONFIG[STATUS_ARG] ?? STATUS_CONFIG['waiting'];
+
+  // Extract rate limit info from payload (Claude Code v2.1.80+)
+  const rateLimit = extractRateLimitInfo(payload);
+
+  // Update session map (skip for session-end — session is over)
+  if (config.upsertSession) {
+    try {
+      const sessionType: 'tmux' | 'ghostty' | undefined =
+        process.env.TMUX ? 'tmux'
+        : process.env.TERM_PROGRAM === 'ghostty' ? 'ghostty'
+        : undefined;
+      upsertSession({
+        cwd,
+        tmuxSession: tmuxSession || `claude-${workspace}`,
+        status: STATUS_ARG,
+        sessionId,
+        sessionType,
+        rateLimit,
+      });
+    } catch (err: unknown) {
+      logger.error(`Failed to update session map: ${(err as Error).message}`);
+    }
+  } else if (rateLimit) {
+    // Even for session-end, update rate limit if present
+    try {
+      updateSessionRateLimit(workspace, rateLimit);
+    } catch {}
+  }
+
+  // If the bot injected this command from Telegram, typing-active exists — always notify
+  // so the response goes back to Telegram regardless of terminal activity.
+  const typingActivePath = path.join(PROJECT_ROOT, 'src/data', 'typing-active');
+  const isTelegramInjected = fs.existsSync(typingActivePath);
+
+  // Suppress notification if user is actively at terminal AND this wasn't Telegram-injected
+  if (!config.alwaysNotify && !isTelegramInjected && isUserActiveAtTerminal()) {
+    try { fs.unlinkSync(typingActivePath); } catch {}
+    return;
+  }
+
+  // Send Telegram notification
+  if (TELEGRAM_ENABLED && BOT_TOKEN && CHAT_ID) {
+    // Dedup: if a richer prompt (permission/question) is already pending for this
+    // workspace, skip the basic "Waiting for input" notification
+    if (STATUS_ARG === 'waiting' && hasPendingForWorkspace(workspace)) {
+      try { fs.unlinkSync(typingActivePath); } catch {}
+      return;
+    }
+
+    // Include session title if available (v2.1.94+)
+    const titleSuffix = sessionTitle ? ` (${escapeHtml(sessionTitle)})` : '';
+    let message = `${config.icon} ${config.label} in <b>${escapeHtml(workspace)}</b>${titleSuffix}`;
+
+    // Status-specific message additions
+    if (STATUS_ARG === 'stop-failure') {
+      // Include error details from StopFailure hook
+      const errorType = payload.error_type as string | undefined;
+      const errorMessage = payload.error_message as string | undefined;
+      if (errorType || errorMessage) {
+        message += `\n\n<b>Error:</b> ${escapeHtml(errorType || 'Unknown')}`;
+        if (errorMessage) {
+          message += `\n${escapeHtml(errorMessage)}`;
+        }
+      }
+    } else if (STATUS_ARG === 'post-compact') {
+      // Include compaction stats if available
+      const beforeTokens = payload.tokens_before as number | undefined;
+      const afterTokens = payload.tokens_after as number | undefined;
+      if (beforeTokens && afterTokens) {
+        const saved = beforeTokens - afterTokens;
+        const percent = Math.round((saved / beforeTokens) * 100);
+        message += `\n\n<i>${beforeTokens.toLocaleString()} → ${afterTokens.toLocaleString()} tokens (${percent}% saved)</i>`;
+      }
+    } else if (STATUS_ARG === 'task-created') {
+      // Include task description
+      const taskDescription = payload.task_description as string | undefined;
+      const taskId = payload.task_id as string | undefined;
+      if (taskDescription) {
+        message += `\n\n${escapeHtml(taskDescription)}`;
+      }
+      if (taskId) {
+        message += `\n<i>ID: ${escapeHtml(taskId)}</i>`;
+      }
+    } else if (STATUS_ARG === 'cwd-changed') {
+      // Include old and new directory
+      const oldCwd = payload.old_cwd as string | undefined;
+      const newCwd = payload.new_cwd as string | undefined;
+      if (oldCwd && newCwd) {
+        const oldWorkspace = extractWorkspaceName(oldCwd);
+        const newWorkspace = extractWorkspaceName(newCwd);
+        message += `\n\n<i>${escapeHtml(oldWorkspace || oldCwd)} → ${escapeHtml(newWorkspace || newCwd)}</i>`;
+      }
+    } else if (STATUS_ARG === 'instructions-loaded') {
+      // Include instructions file path
+      const instructionsPath = payload.instructions_path as string | undefined;
+      if (instructionsPath) {
+        message += `\n\n<i>${escapeHtml(instructionsPath)}</i>`;
+      }
+    }
+
+    // Append Claude's last response text (skip for session-start and simple notifications)
+    const skipResponseText = ['session-start', 'post-compact', 'task-created', 'cwd-changed', 'instructions-loaded'];
+    if (!skipResponseText.includes(STATUS_ARG)) {
+      const responseText = getResponseText(payload);
+      if (responseText) {
+        const truncated = responseText.length > 3500
+          ? responseText.slice(0, 3497) + '...'
+          : responseText;
+        message += `\n\n${markdownToHtml(truncated)}`;
+      }
+    }
+
+    // Remove typing signal file BEFORE sending
+    try { fs.unlinkSync(typingActivePath); } catch {}
+
+    try {
+      const result = await sendTelegram(message, 'HTML');
+      if (result && result.message_id) {
+        trackNotificationMessage(result.message_id, workspace, `hook-${STATUS_ARG}`);
+      }
+    } catch {
+      // HTML failed — send as plain text
+      try {
+        const plain = message.replace(/<[^>]+>/g, '');
+        const result = await sendTelegram(plain, false);
+        if (result && result.message_id) {
+          trackNotificationMessage(result.message_id, workspace, `hook-${STATUS_ARG}`);
+        }
+      } catch (err2: unknown) {
+        logger.error(`Telegram send failed: ${(err2 as Error).message}`);
+      }
+    }
+  }
+}
+
+// ── Response text extraction ─────────────────────────────────────
+
+/**
+ * Get Claude's last response text from the hook payload.
+ * Prefers last_assistant_message (v2.1.47+), falls back to transcript parsing.
+ * For SubagentStop, also tries agent_transcript_path.
+ */
+function getResponseText(payload: Record<string, unknown>): string | null {
+  // Direct field — available in Claude Code v2.1.47+
+  const direct = payload.last_assistant_message as string | undefined;
+  if (direct) return direct;
+
+  // Transcript fallback for older Claude Code versions
+  const agentTranscript = payload.agent_transcript_path as string | undefined;
+  if (agentTranscript) {
+    try { return extractLastResponse(agentTranscript); } catch {}
+  }
+  const transcript = payload.transcript_path as string | undefined;
+  if (transcript) {
+    try { return extractLastResponse(transcript); } catch {}
+  }
+  return null;
+}
+
+// ── Telegram ────────────────────────────────────────────────────
+
+function sendTelegram(text: string, parseMode: string | false = 'Markdown'): Promise<TelegramMessage | null> {
+  return new Promise((resolve, reject) => {
+    const msgPayload: Record<string, unknown> = { chat_id: CHAT_ID, text };
+    if (parseMode) msgPayload.parse_mode = parseMode;
+    const body = JSON.stringify(msgPayload);
+
+    const options: https.RequestOptions = {
+      hostname: 'api.telegram.org',
+      path: `/bot${BOT_TOKEN}/sendMessage`,
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'Content-Length': Buffer.byteLength(body),
+      },
+      timeout: 5000,
+    };
+
+    const req = https.request(options, (res) => {
+      let data = '';
+      res.on('data', (chunk: string) => { data += chunk; });
+      res.on('end', () => {
+        if (res.statusCode! >= 200 && res.statusCode! < 300) {
+          try {
+            const parsed = JSON.parse(data);
+            resolve(parsed.result || null);
+          } catch {
+            resolve(null);
+          }
+        } else {
+          reject(new Error(`Telegram API ${res.statusCode}: ${data}`));
+        }
+      });
+    });
+
+    req.on('error', reject);
+    req.on('timeout', () => {
+      req.destroy();
+      reject(new Error('Telegram request timed out'));
+    });
+
+    req.write(body);
+    req.end();
+  });
+}
+
+// ── Helpers ──────────────────────────────────────────────────────
+
+/**
+ * Extract rate limit info from hook payload (Claude Code v2.1.80+).
+ * Rate limits may appear in statusline data or direct payload fields.
+ */
+function extractRateLimitInfo(payload: Record<string, unknown>): RateLimitInfo | undefined {
+  // Try direct rate_limits field
+  const rateLimits = payload.rate_limits as Record<string, unknown> | undefined;
+  if (rateLimits) {
+    return {
+      remaining: rateLimits.remaining as number | undefined,
+      limit: rateLimits.limit as number | undefined,
+      resetsAt: rateLimits.resets_at as number | undefined,
+      updatedAt: Date.now(),
+    };
+  }
+
+  // Try statusline object (may contain rate limit info)
+  const statusline = payload.statusline as Record<string, unknown> | undefined;
+  if (statusline?.rate_limits) {
+    const sl = statusline.rate_limits as Record<string, unknown>;
+    return {
+      remaining: sl.remaining as number | undefined,
+      limit: sl.limit as number | undefined,
+      resetsAt: sl.resets_at as number | undefined,
+      updatedAt: Date.now(),
+    };
+  }
+
+  return undefined;
+}
+
+function extractLastResponse(transcriptPath: string): string | null {
+  const data = fs.readFileSync(transcriptPath, 'utf8').trimEnd();
+  const lines = data.split('\n');
+  for (let i = lines.length - 1; i >= 0; i--) {
+    try {
+      const entry = JSON.parse(lines[i]);
+      if (entry.type === 'assistant' && entry.message?.content) {
+        const texts = entry.message.content
+          .filter((c: Record<string, unknown>) => c.type === 'text')
+          .map((c: Record<string, unknown>) => c.text);
+        if (texts.length > 0) return texts.join('\n\n');
+      }
+    } catch {}
+  }
+  return null;
+}
+
+function readStdin(): Promise<string> {
+  return new Promise((resolve) => {
+    let data = '';
+    let resolved = false;
+    process.stdin.setEncoding('utf8');
+    process.stdin.on('data', (chunk: string) => { data += chunk; });
+    process.stdin.on('end', () => {
+      if (!resolved) { resolved = true; resolve(data); }
+    });
+
+    setTimeout(() => {
+      if (!resolved) {
+        resolved = true;
+        process.stdin.destroy();
+        resolve(data || '{}');
+      }
+    }, 500);
+  });
+}
+
+function detectSessionName(cwd: string): string | null {
+  // 1. Try tmux (preferred — gives actual session name)
+  if (process.env.TMUX) {
+    try {
+      const { execSync } = require('child_process');
+      return execSync('tmux display-message -p "#S"', { encoding: 'utf8' }).trim();
+    } catch {}
+  }
+  // 2. Ghostty — derive from CWD (same sanitization as tmux-less path)
+  if (process.env.TERM_PROGRAM === 'ghostty') {
+    const raw = extractWorkspaceName(cwd);
+    return raw ? raw.replace(/[.:\s]/g, '-') : null;
+  }
+  // 3. Derive from CWD — sanitize so it matches PTY handle key format
+  const raw = extractWorkspaceName(cwd);
+  if (!raw) return null;
+  return raw.replace(/[.:\s]/g, '-');
+}
+
+function escapeHtml(text: string): string {
+  return text.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+}
+
+function markdownToHtml(text: string): string {
+  let html = escapeHtml(text);
+  const placeholders: string[] = [];
+
+  // Extract code blocks/inline code first to protect them from bold/italic regexes
+  html = html.replace(/```(\w*)\n([\s\S]*?)```/g, (_: string, __: string, code: string) => {
+    const idx = placeholders.length;
+    placeholders.push(`<pre>${code.trim()}</pre>`);
+    return `\x00P${idx}\x00`;
+  });
+  html = html.replace(/`([^`]+)`/g, (_: string, code: string) => {
+    const idx = placeholders.length;
+    placeholders.push(`<code>${code}</code>`);
+    return `\x00P${idx}\x00`;
+  });
+
+  // Apply inline formatting only to non-code text
+  html = html.replace(/\*\*(.+?)\*\*/g, '<b>$1</b>');
+  html = html.replace(/\*(.+?)\*/g, '<i>$1</i>');
+  html = html.replace(/^[-*]\s+/gm, '\u2022 ');
+  html = html.replace(/^#{1,6}\s+/gm, '');
+
+  // Restore code placeholders
+  html = html.replace(/\x00P(\d+)\x00/g, (_: string, idx: string) => placeholders[parseInt(idx)]);
+  return html;
+}
+
+// ── Run ─────────────────────────────────────────────────────────
+
+main().catch((err: Error) => {
+  logger.error(`Fatal: ${err.message}`);
+  process.exit(1);
+});

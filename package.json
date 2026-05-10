@@ -1,0 +1,82 @@
+{
+  "name": "urocc",
+  "version": "0.1.0",
+  "description": "Control Claude Code from Telegram — fork of jsayubi/ccgram with Chinese-path fixes, /clear, scoped /resume, pinned-workspace UI, and other UX improvements.",
+  "main": "dist/workspace-telegram-bot.js",
+  "bin": {
+    "urocc": "./dist/cli.js"
+  },
+  "files": [
+    "dist/",
+    "config/",
+    "src/types/",
+    "urocc.service",
+    ".env.example",
+    "LICENSE",
+    "README.md"
+  ],
+  "scripts": {
+    "start": "node dist/workspace-telegram-bot.js",
+    "setup": "node dist/setup.js",
+    "config": "node dist/src/tools/config-manager.js",
+    "daemon:start": "node dist/claude-remote.js daemon start",
+    "daemon:stop": "node dist/claude-remote.js daemon stop",
+    "daemon:status": "node dist/claude-remote.js daemon status",
+    "relay:pty": "node dist/start-relay-pty.js",
+    "relay:start": "INJECTION_MODE=pty node dist/src/relay/relay-pty.js",
+    "telegram": "node dist/start-telegram-webhook.js",
+    "line": "node dist/start-line-webhook.js",
+    "webhooks": "node dist/start-all-webhooks.js",
+    "build": "tsc",
+    "build:watch": "tsc --watch",
+    "test": "vitest run",
+    "prepublishOnly": "npm run build && npm test"
+  },
+  "keywords": [
+    "urocc",
+    "claude-code",
+    "telegram-bot",
+    "remote-control",
+    "ai-coding",
+    "developer-tools",
+    "claude",
+    "anthropic"
+  ],
+  "author": "Stefan Song",
+  "contributors": [
+    "JS Ayubi (original ccgram author)"
+  ],
+  "license": "MIT",
+  "engines": {
+    "node": ">=18.0.0"
+  },
+  "os": [
+    "darwin",
+    "linux",
+    "win32"
+  ],
+  "repository": {
+    "type": "git",
+    "url": "git+ssh://git@github.com/stefan-song/urocc.git"
+  },
+  "bugs": {
+    "url": "https://github.com/stefan-song/urocc/issues"
+  },
+  "homepage": "https://github.com/stefan-song/urocc",
+  "dependencies": {
+    "dotenv": "^17.2.1"
+  },
+  "optionalDependencies": {
+    "express": "^4.18.2",
+    "mailparser": "^3.7.4",
+    "node-pty": "^1.0.0",
+    "nodemailer": "^7.0.5",
+    "pino": "^9.7.0",
+    "pino-pretty": "^13.0.0"
+  },
+  "devDependencies": {
+    "@types/node": "~22.15.0",
+    "typescript": "~5.7.3",
+    "vitest": "^4.0.18"
+  }
+}
