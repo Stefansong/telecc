@@ -1,5 +1,5 @@
 /**
- * Telegram Bot API types (subset used by urocc).
+ * Telegram Bot API types (subset used by telecc).
  */
 
 export interface TelegramUser {

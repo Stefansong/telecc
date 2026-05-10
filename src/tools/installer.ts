@@ -1,5 +1,5 @@
 /**
- * urocc Installer
+ * telecc Installer
  * Handles installation and configuration of Claude Code hooks
  */
 
@@ -70,7 +70,7 @@ class Installer {
     }
 
     async run(args: string[] = []): Promise<void> {
-        console.log('=== urocc Claude Code Installer ===\n');
+        console.log('=== telecc Claude Code Installer ===\n');
 
         // Check dependencies
         if (!this.checkDependencies()) {

@@ -455,7 +455,7 @@ function recordProjectUsage(name: string, projectPath: string, sessionId?: strin
   fs.writeFileSync(PROJECT_HISTORY_PATH, JSON.stringify(trimmed, null, 2), 'utf8');
 }
 
-const PINNED_PROJECTS = ['assistant', 'urocc'];
+const PINNED_PROJECTS = ['assistant', 'telecc'];
 
 function getRecentProjects(limit: number = 50): Array<{ name: string; path: string }> {
   const home = process.env.HOME || require('os').homedir();

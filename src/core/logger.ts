@@ -1,5 +1,5 @@
 /**
- * urocc Logger
+ * telecc Logger
  * Centralized logging utility
  */
 
@@ -8,7 +8,7 @@ type LogLevel = 'debug' | 'info' | 'warn' | 'error';
 class Logger {
     namespace: string;
 
-    constructor(namespace: string = 'urocc') {
+    constructor(namespace: string = 'telecc') {
         this.namespace = namespace;
     }
 

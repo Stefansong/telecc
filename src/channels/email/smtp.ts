@@ -224,7 +224,7 @@ class EmailChannel extends NotificationChannel {
         const emailContent = this._generateEmailContent(notification, sessionId, token);
 
         // Generate unique Message-ID
-        const messageId = `<${sessionId}-${Date.now()}@urocc>`;
+        const messageId = `<${sessionId}-${Date.now()}@telecc>`;
 
         const mailOptions = {
             from: config.from || config.smtp!.auth.user,
@@ -235,8 +235,8 @@ class EmailChannel extends NotificationChannel {
             messageId: messageId,
             // Add custom headers for reply recognition
             headers: {
-                'X-urocc-Session-ID': sessionId,
-                'X-urocc-Type': notification.type
+                'X-telecc-Session-ID': sessionId,
+                'X-telecc-Type': notification.type
             }
         };
 
@@ -291,7 +291,7 @@ class EmailChannel extends NotificationChannel {
         }
 
         // Use passed tmux session name or detect current session
-        const tmuxSession = (notification.metadata?.tmuxSession as string) || this._getCurrentTmuxSession() || 'urocc';
+        const tmuxSession = (notification.metadata?.tmuxSession as string) || this._getCurrentTmuxSession() || 'telecc';
 
         sessionMap[token] = {
             type: 'pty',
@@ -461,7 +461,7 @@ class EmailChannel extends NotificationChannel {
         // Default templates
         const templates: Record<string, TemplateSet> = {
             completed: {
-                subject: '[urocc #{{token}}] Claude Code Task Completed - {{project}}',
+                subject: '[telecc #{{token}}] Claude Code Task Completed - {{project}}',
                 html: `
                 <div style="font-family: 'Consolas', 'Monaco', 'Courier New', monospace; background-color: #f5f5f5; padding: 0; margin: 0;">
                     <div style="max-width: 900px; margin: 0 auto; background-color: #1e1e1e; border: 1px solid #333; box-shadow: 0 4px 10px rgba(0, 0, 0, 0.3);">
@@ -472,7 +472,7 @@ class EmailChannel extends NotificationChannel {
                                     <td style="padding: 0;"><div style="width: 12px; height: 12px; border-radius: 50%; background-color: #ff5f56;"></div></td>
                                     <td style="padding: 0 0 0 5px;"><div style="width: 12px; height: 12px; border-radius: 50%; background-color: #ffbd2e;"></div></td>
                                     <td style="padding: 0 0 0 5px;"><div style="width: 12px; height: 12px; border-radius: 50%; background-color: #27c93f;"></div></td>
-                                    <td style="padding: 0 0 0 12px; color: #999; font-size: 14px; white-space: nowrap;">urocc@{{project}} - Task Completed</td>
+                                    <td style="padding: 0 0 0 12px; color: #999; font-size: 14px; white-space: nowrap;">telecc@{{project}} - Task Completed</td>
                                 </tr>
                             </table>
                         </div>
@@ -529,7 +529,7 @@ class EmailChannel extends NotificationChannel {
                 </div>
                 `,
                 text: `
-[urocc #{{token}}] Claude Code Task Completed - {{projectDir}} | {{shortQuestion}}
+[telecc #{{token}}] Claude Code Task Completed - {{projectDir}} | {{shortQuestion}}
 
 Project: {{projectDir}}
 Time: {{timestamp}}
@@ -556,7 +556,7 @@ Security Note: Please do not forward this email, session will automatically expi
                 `
             },
             waiting: {
-                subject: '[urocc #{{token}}] Claude Code Waiting for Input - {{project}}',
+                subject: '[telecc #{{token}}] Claude Code Waiting for Input - {{project}}',
                 html: `
                 <div style="font-family: 'Consolas', 'Monaco', 'Courier New', monospace; background-color: #f5f5f5; padding: 0; margin: 0;">
                     <div style="max-width: 900px; margin: 0 auto; background-color: #1e1e1e; border: 1px solid #333; box-shadow: 0 4px 10px rgba(0, 0, 0, 0.3);">
@@ -567,7 +567,7 @@ Security Note: Please do not forward this email, session will automatically expi
                                     <td style="padding: 0;"><div style="width: 12px; height: 12px; border-radius: 50%; background-color: #ff5f56;"></div></td>
                                     <td style="padding: 0 0 0 5px;"><div style="width: 12px; height: 12px; border-radius: 50%; background-color: #ffbd2e;"></div></td>
                                     <td style="padding: 0 0 0 5px;"><div style="width: 12px; height: 12px; border-radius: 50%; background-color: #27c93f;"></div></td>
-                                    <td style="padding: 0 0 0 12px; color: #999; font-size: 14px; white-space: nowrap;">urocc@{{project}} - Waiting for Input</td>
+                                    <td style="padding: 0 0 0 12px; color: #999; font-size: 14px; white-space: nowrap;">telecc@{{project}} - Waiting for Input</td>
                                 </tr>
                             </table>
                         </div>
@@ -615,7 +615,7 @@ Security Note: Please do not forward this email, session will automatically expi
                                     SESSION_ID={{sessionId}}<br>
                                     EXPIRES_IN=24h<br>
                                     SECURITY=Do not forward this email<br>
-                                    POWERED_BY=urocc
+                                    POWERED_BY=telecc
                                 </div>
                             </div>
                         </div>
@@ -623,7 +623,7 @@ Security Note: Please do not forward this email, session will automatically expi
                 </div>
                 `,
                 text: `
-[urocc #{{token}}] Claude Code Waiting for Input - {{projectDir}}
+[telecc #{{token}}] Claude Code Waiting for Input - {{projectDir}}
 
 Project: {{projectDir}}
 Time: {{timestamp}}
@@ -676,9 +676,9 @@ Security Note: Please do not forward this email, session will automatically expi
             // Send test email
             const testNotification: Notification = {
                 type: 'completed',
-                title: 'urocc Test',
+                title: 'telecc Test',
                 message: 'This is a test email to verify that the email notification function is working properly.',
-                project: 'urocc-Test',
+                project: 'telecc-Test',
                 metadata: {
                     test: true,
                     timestamp: new Date().toISOString(),

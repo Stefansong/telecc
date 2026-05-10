@@ -1,16 +1,16 @@
 {
-  "name": "urocc",
+  "name": "telecc",
   "version": "0.1.0",
   "description": "Control Claude Code from Telegram — fork of jsayubi/ccgram with Chinese-path fixes, /clear, scoped /resume, pinned-workspace UI, and other UX improvements.",
   "main": "dist/workspace-telegram-bot.js",
   "bin": {
-    "urocc": "./dist/cli.js"
+    "telecc": "./dist/cli.js"
   },
   "files": [
     "dist/",
     "config/",
     "src/types/",
-    "urocc.service",
+    "telecc.service",
     ".env.example",
     "LICENSE",
     "README.md"
@@ -33,7 +33,7 @@
     "prepublishOnly": "npm run build && npm test"
   },
   "keywords": [
-    "urocc",
+    "telecc",
     "claude-code",
     "telegram-bot",
     "remote-control",
@@ -57,12 +57,12 @@
   ],
   "repository": {
     "type": "git",
-    "url": "git+ssh://git@github.com/stefan-song/urocc.git"
+    "url": "git+ssh://git@github.com/stefan-song/telecc.git"
   },
   "bugs": {
-    "url": "https://github.com/stefan-song/urocc/issues"
+    "url": "https://github.com/stefan-song/telecc/issues"
   },
-  "homepage": "https://github.com/stefan-song/urocc",
+  "homepage": "https://github.com/stefan-song/telecc",
   "dependencies": {
     "dotenv": "^17.2.1"
   },

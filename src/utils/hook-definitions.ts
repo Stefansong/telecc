@@ -1,7 +1,7 @@
 /**
- * Single source of truth for the Claude Code hooks urocc installs.
+ * Single source of truth for the Claude Code hooks telecc installs.
  *
- * Both the interactive `setup.ts` wizard and the `cli.ts` (`urocc hooks`)
+ * Both the interactive `setup.ts` wizard and the `cli.ts` (`telecc hooks`)
  * command import from here so they cannot drift apart again.
  */
 
@@ -20,7 +20,7 @@ export interface HookDefinition {
   if?: string;
 }
 
-/** Every hook urocc installs. Order matches the order in which hooks fire. */
+/** Every hook telecc installs. Order matches the order in which hooks fire. */
 export const HOOK_DEFINITIONS: HookDefinition[] = [
   // Core hooks
   { event: 'PermissionRequest',  script: 'permission-hook.js',         timeout: 120 },

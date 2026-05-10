@@ -1,5 +1,5 @@
 /**
- * urocc Configuration Manager
+ * telecc Configuration Manager
  * Interactive configuration tool for managing settings
  */
 
@@ -62,7 +62,7 @@ class ConfigurationManager {
 
     async showMainMenu(): Promise<void> {
         while (true) {
-            console.log('\n=== urocc Configuration Manager ===');
+            console.log('\n=== telecc Configuration Manager ===');
             this.displayCurrentConfig();
             console.log('Options:');
             console.log('1. Basic Settings');
@@ -421,7 +421,7 @@ class ConfigurationManager {
         // Sender configuration
         const currentFrom = emailConfig.from || '';
         console.log(`Current sender: ${currentFrom || 'Not configured'}`);
-        const fromEmail = await this.question(`Sender display name (default: urocc <${smtpUser}>): `);
+        const fromEmail = await this.question(`Sender display name (default: telecc <${smtpUser}>): `);
 
         // Build email configuration
         const newEmailConfig = {
@@ -445,7 +445,7 @@ class ConfigurationManager {
                         pass: smtpPass || emailConfig.imap?.auth?.pass || ''
                     }
                 },
-                from: fromEmail || `urocc <${smtpUser || currentUser}>`,
+                from: fromEmail || `telecc <${smtpUser || currentUser}>`,
                 to: toEmail || currentTo
             }
         };
@@ -492,7 +492,7 @@ class ConfigurationManager {
 
     showHelp(): void {
         console.log(`
-urocc Configuration Manager
+telecc Configuration Manager
 
 Usage: claude-remote config [options]
 

@@ -155,11 +155,11 @@ function isAllowed(fromAddress: string): boolean {
     return ALLOWED_SENDERS.some(allowed => addr.includes(allowed));
 }
 
-// Extract urocc token from subject
+// Extract telecc token from subject
 function extractTokenFromSubject(subject: string = ''): string | null {
     const patterns = [
-        /\[urocc\s+#([A-Z0-9]+)\]/,
-        /Re:\s*\[urocc\s+#([A-Z0-9]+)\]/
+        /\[telecc\s+#([A-Z0-9]+)\]/,
+        /Re:\s*\[telecc\s+#([A-Z0-9]+)\]/
     ];
 
     for (const pattern of patterns) {
@@ -183,7 +183,7 @@ function cleanEmailText(text: string = ''): string {
             line.includes('On') && line.includes('wrote:') ||
             line.includes('Session ID:') ||
             line.includes(`<${process.env.SMTP_USER}>`) ||
-            line.includes('urocc Notification System') ||
+            line.includes('telecc Notification System') ||
             line.includes('on 2025') && line.includes('wrote:') ||
             line.match(/^>.*/) ||  // Quote lines start with >
             line.includes('From:') && line.includes('@') ||
@@ -224,7 +224,7 @@ function cleanEmailText(text: string = ''): string {
         }
 
         // Skip remaining email quotes
-        if (trimmedLine.includes('urocc Notification System') ||
+        if (trimmedLine.includes('telecc Notification System') ||
             trimmedLine.includes(`<${process.env.SMTP_USER}>`) ||
             trimmedLine.includes('on 2025')) {
             continue;

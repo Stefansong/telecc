@@ -12,7 +12,7 @@ const [,, cmd, ...args] = process.argv;
 
 /**
  * Resolve the dist/ directory to use for runtime commands.
- * Prefers ~/.urocc/dist/ if it exists (persistent install), falls back to __dirname.
+ * Prefers ~/.telecc/dist/ if it exists (persistent install), falls back to __dirname.
  */
 function resolveDistDir(): string {
   const homeDistDir = path.join(CCGRAM_HOME, 'dist');
@@ -24,7 +24,7 @@ function resolveDistDir(): string {
 
 /**
  * Resolve the project root for data paths.
- * Prefers ~/.urocc/ if it has been initialized, falls back to PROJECT_ROOT.
+ * Prefers ~/.telecc/ if it has been initialized, falls back to PROJECT_ROOT.
  */
 function resolveDataRoot(): string {
   if (fs.existsSync(path.join(CCGRAM_HOME, 'package.json'))) {
@@ -36,7 +36,7 @@ function resolveDataRoot(): string {
 switch (cmd) {
   case 'init':
   case 'setup':
-    // Always use current package for init — ensures updates propagate to ~/.urocc/
+    // Always use current package for init — ensures updates propagate to ~/.telecc/
     spawn(process.execPath, [path.join(__dirname, 'setup.js')], { stdio: 'inherit' })
       .on('exit', (code) => process.exit(code ?? 0));
     break;
@@ -45,7 +45,7 @@ switch (cmd) {
     const distDir = resolveDistDir();
     const botScript = path.join(distDir, 'workspace-telegram-bot.js');
     if (!fs.existsSync(botScript)) {
-      console.error('Error: urocc is not installed. Run `urocc init` first.');
+      console.error('Error: telecc is not installed. Run `telecc init` first.');
       process.exit(1);
     }
     spawn(process.execPath, [botScript], { stdio: 'inherit' })
@@ -88,8 +88,8 @@ switch (cmd) {
   }
 
   default:
-    console.log('urocc — Control Claude Code from Telegram\n');
-    console.log('Usage: urocc <command>\n');
+    console.log('telecc — Control Claude Code from Telegram\n');
+    console.log('Usage: telecc <command>\n');
     console.log('Commands:');
     console.log('  init      Run interactive setup (configure .env and Claude hooks)');
     console.log('  start     Start the Telegram bot');

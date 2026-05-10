@@ -3,7 +3,7 @@
 // Node.js version check — must run before anything else
 const [major] = process.versions.node.split('.').map(Number);
 if (major < 18) {
-    console.error(`urocc requires Node.js >= 18.0.0 (you have ${process.version}).`);
+    console.error(`telecc requires Node.js >= 18.0.0 (you have ${process.version}).`);
     console.error('Upgrade: https://nodejs.org/ or use nvm: nvm install 18');
     process.exit(1);
 }
@@ -180,7 +180,7 @@ function sendHtmlMessage(text: string): Promise<unknown> {
  * sends + pins a new one only if the prior message was deleted by the user.
  * Fire-and-forget — never blocks the calling handler.
  */
-const PIN_FILE: string = path.join(os.homedir(), '.urocc/src/data/pinned-message.json');
+const PIN_FILE: string = path.join(os.homedir(), '.telecc/src/data/pinned-message.json');
 async function updatePinnedWorkspace(): Promise<void> {
   try {
     const ws = getDefaultWorkspace();
@@ -1120,7 +1120,7 @@ async function startProject(name: string): Promise<void> {
   } else {
     await sendMessage(
       '\u26a0\ufe0f No injection backend available.\n' +
-      'Install tmux, run Ghostty, or run: `npm install node-pty` in ~/.urocc/'
+      'Install tmux, run Ghostty, or run: `npm install node-pty` in ~/.telecc/'
     );
   }
 }
@@ -1440,7 +1440,7 @@ async function startProjectResume(name: string, projectDir: string, sessionId: s
   } else {
     await sendMessage(
       '\u26a0\ufe0f No injection backend available.\n' +
-      'Install tmux, run Ghostty, or run: `npm install node-pty` in ~/.urocc/'
+      'Install tmux, run Ghostty, or run: `npm install node-pty` in ~/.telecc/'
     );
   }
 }
@@ -2177,7 +2177,7 @@ async function start(): Promise<void> {
   fs.mkdirSync(dataDir, { recursive: true });
 
   const { version } = require(path.join(PROJECT_ROOT, 'package.json'));
-  logger.info(`urocc v${version} — Starting Telegram bot (long polling)...`);
+  logger.info(`telecc v${version} — Starting Telegram bot (long polling)...`);
   logger.info(`Chat ID: ${CHAT_ID}`);
 
   // Prune expired sessions on startup

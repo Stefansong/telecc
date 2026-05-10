@@ -81,8 +81,8 @@ class ConfigManager {
 
         // Email addresses
         console.log('\n--- Email Addresses ---');
-        const fromEmail = await this.question(`From Address [${config.email.config.from || `urocc <${config.email.config.smtp.auth.user}>`}]: `);
-        config.email.config.from = fromEmail || config.email.config.from || `urocc <${config.email.config.smtp.auth.user}>`;
+        const fromEmail = await this.question(`From Address [${config.email.config.from || `telecc <${config.email.config.smtp.auth.user}>`}]: `);
+        config.email.config.from = fromEmail || config.email.config.from || `telecc <${config.email.config.smtp.auth.user}>`;
 
         const toEmail = await this.question(`To Address [${config.email.config.to || config.email.config.smtp.auth.user}]: `);
         config.email.config.to = toEmail || config.email.config.to || config.email.config.smtp.auth.user;
@@ -134,7 +134,7 @@ class ConfigManager {
     }
 
     async interactiveMenu(): Promise<void> {
-        console.log('\n🛠️  urocc Configuration Manager\n');
+        console.log('\n🛠️  telecc Configuration Manager\n');
 
         while (true) {
             console.log('\nChoose an option:');

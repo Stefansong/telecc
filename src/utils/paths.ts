@@ -16,7 +16,7 @@ export const PROJECT_ROOT: string = (() => {
 })();
 
 /**
- * Persistent install directory for urocc.
- * `urocc init` copies the package here so hook paths survive npx cleanup.
+ * Persistent install directory for telecc.
+ * `telecc init` copies the package here so hook paths survive npx cleanup.
  */
-export const CCGRAM_HOME: string = path.join(os.homedir(), '.urocc');
+export const CCGRAM_HOME: string = path.join(os.homedir(), '.telecc');

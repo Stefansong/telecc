@@ -60,7 +60,7 @@ class DesktopChannel extends NotificationChannel {
         try {
             // Try terminal-notifier first
             try {
-                const cmd = `terminal-notifier -title "${title}" -message "${message}" -sound "${sound}" -group "urocc"`;
+                const cmd = `terminal-notifier -title "${title}" -message "${message}" -sound "${sound}" -group "telecc"`;
                 execSync(cmd, { timeout: parseInt(process.env.NOTIFICATION_TIMEOUT as string) || 3000 });
                 return true;
             } catch (e: unknown) {
@@ -100,7 +100,7 @@ class DesktopChannel extends NotificationChannel {
             $xml.toast.visual.binding.text[0].AppendChild($xml.CreateTextNode("${title}")) > $null
             $xml.toast.visual.binding.text[1].AppendChild($xml.CreateTextNode("${message}")) > $null
             $toast = [Windows.UI.Notifications.ToastNotification]::new($xml)
-            [Windows.UI.Notifications.ToastNotificationManager]::CreateToastNotifier("urocc").Show($toast)
+            [Windows.UI.Notifications.ToastNotificationManager]::CreateToastNotifier("telecc").Show($toast)
             `;
 
             execSync(`powershell -Command "${script}"`, { timeout: 5000 });

@@ -2,7 +2,7 @@
  * PTY Session Manager — manages headless node-pty sessions for tmux-less operation.
  *
  * When tmux is unavailable, /new spawns Claude via node-pty instead of tmux.
- * urocc owns the PTY master, so all Telegram features (permissions, questions,
+ * telecc owns the PTY master, so all Telegram features (permissions, questions,
  * commands, /status, /stop) work without tmux. Sessions are not attachable from
  * a terminal.
  *

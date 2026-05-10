@@ -9,7 +9,7 @@ function optionalRequire(moduleName: string, featureName: string): unknown {
     } catch (err: unknown) {
         if (err && typeof err === 'object' && 'code' in err && err.code === 'MODULE_NOT_FOUND') {
             console.warn(
-                `[urocc] Optional dependency "${moduleName}" not installed. ` +
+                `[telecc] Optional dependency "${moduleName}" not installed. ` +
                 `Feature "${featureName}" will be unavailable. ` +
                 `Install with: npm install ${moduleName}`
             );

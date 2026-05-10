@@ -1,5 +1,5 @@
 /**
- * urocc Core Notifier
+ * telecc Core Notifier
  * Central notification orchestrator that manages multiple channels
  */
 

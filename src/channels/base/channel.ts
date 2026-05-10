@@ -64,7 +64,7 @@ abstract class NotificationChannel {
 
         const testNotification: Notification = {
             type: 'completed',
-            title: 'urocc Test',
+            title: 'telecc Test',
             message: `Test notification from ${this.name} channel`,
             project: 'test-project',
             metadata: { test: true, timestamp: new Date().toISOString(), language: 'en' }

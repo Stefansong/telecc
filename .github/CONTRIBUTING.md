@@ -1,13 +1,13 @@
-First of all, many thanks to everyone who wants to contribute to urocc!
+First of all, many thanks to everyone who wants to contribute to telecc!
 
-# Contributing to urocc
+# Contributing to telecc
 
 ## 🚀 Quick Start
 
 ```bash
 # Fork, clone, and setup
-git clone https://github.com/YOUR_USERNAME/urocc.git
-cd urocc
+git clone https://github.com/YOUR_USERNAME/telecc.git
+cd telecc
 npm install
 cp .env.example .env
 

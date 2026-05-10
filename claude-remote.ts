@@ -1,11 +1,11 @@
 #!/usr/bin/env node
 
 /**
- * urocc - Claude Code Smart Notification System
+ * telecc - Claude Code Smart Notification System
  * Main entry point for the CLI tool
  */
 
-// Load environment variables from urocc directory
+// Load environment variables from telecc directory
 import path from 'path';
 import { PROJECT_ROOT } from './src/utils/paths';
 const envPath = path.join(PROJECT_ROOT, '.env');
@@ -273,7 +273,7 @@ class ClaudeCodeRemoteCLI {
     async handleStatus(args: string[]): Promise<void> {
         const status = this.notifier.getStatus() as Record<string, any>;
 
-        console.log('urocc Status\n');
+        console.log('telecc Status\n');
         console.log('Configuration:');
         console.log(`  Enabled: ${status.enabled ? 'Yes' : 'No'}`);
         console.log(`  Language: ${status.config.language}`);
@@ -620,7 +620,7 @@ class ClaudeCodeRemoteCLI {
         };
 
         try {
-            console.log('🚀 urocc Email Quick Setup Wizard\n');
+            console.log('🚀 telecc Email Quick Setup Wizard\n');
 
             // Select email provider
             console.log('Please select your email provider:');
@@ -715,7 +715,7 @@ class ClaudeCodeRemoteCLI {
                             pass: password
                         }
                     },
-                    from: `urocc <${email}>`,
+                    from: `telecc <${email}>`,
                     to: email,
                     template: {
                         checkInterval: 30
@@ -988,7 +988,7 @@ class ClaudeCodeRemoteCLI {
 
     showHelp(): void {
         console.log(`
-urocc - Claude Code Smart Notification System
+telecc - Claude Code Smart Notification System
 
 Usage: claude-remote <command> [options]
 

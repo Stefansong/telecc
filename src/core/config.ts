@@ -1,5 +1,5 @@
 /**
- * urocc Configuration Manager
+ * telecc Configuration Manager
  * Handles loading, merging, and saving configurations
  */
 
@@ -88,7 +88,7 @@ class ConfigManager {
                             pass: process.env.IMAP_PASS || process.env.SMTP_PASS || ''
                         }
                     },
-                    from: process.env.EMAIL_FROM || `${process.env.EMAIL_FROM_NAME || 'urocc'} <${process.env.SMTP_USER}>`,
+                    from: process.env.EMAIL_FROM || `${process.env.EMAIL_FROM_NAME || 'telecc'} <${process.env.SMTP_USER}>`,
                     to: process.env.EMAIL_TO || '',
                     template: {
                         checkInterval: parseInt(process.env.CHECK_INTERVAL || '') || 30
@@ -100,7 +100,7 @@ class ConfigManager {
                 enabled: false,
                 config: {
                     webhook: '',
-                    username: 'urocc',
+                    username: 'telecc',
                     avatar: null
                 }
             },

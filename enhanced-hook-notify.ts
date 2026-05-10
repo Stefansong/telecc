@@ -9,16 +9,16 @@
  *          CwdChanged (cwd-changed), InstructionsLoaded (instructions-loaded).
  *
  * Usage (in ~/.claude/settings.json hooks):
- *   node /path/to/urocc/dist/enhanced-hook-notify.js completed
- *   node /path/to/urocc/dist/enhanced-hook-notify.js waiting
- *   node /path/to/urocc/dist/enhanced-hook-notify.js session-start
- *   node /path/to/urocc/dist/enhanced-hook-notify.js session-end
- *   node /path/to/urocc/dist/enhanced-hook-notify.js subagent-done
- *   node /path/to/urocc/dist/enhanced-hook-notify.js stop-failure
- *   node /path/to/urocc/dist/enhanced-hook-notify.js post-compact
- *   node /path/to/urocc/dist/enhanced-hook-notify.js task-created
- *   node /path/to/urocc/dist/enhanced-hook-notify.js cwd-changed
- *   node /path/to/urocc/dist/enhanced-hook-notify.js instructions-loaded
+ *   node /path/to/telecc/dist/enhanced-hook-notify.js completed
+ *   node /path/to/telecc/dist/enhanced-hook-notify.js waiting
+ *   node /path/to/telecc/dist/enhanced-hook-notify.js session-start
+ *   node /path/to/telecc/dist/enhanced-hook-notify.js session-end
+ *   node /path/to/telecc/dist/enhanced-hook-notify.js subagent-done
+ *   node /path/to/telecc/dist/enhanced-hook-notify.js stop-failure
+ *   node /path/to/telecc/dist/enhanced-hook-notify.js post-compact
+ *   node /path/to/telecc/dist/enhanced-hook-notify.js task-created
+ *   node /path/to/telecc/dist/enhanced-hook-notify.js cwd-changed
+ *   node /path/to/telecc/dist/enhanced-hook-notify.js instructions-loaded
  */
 
 import fs from 'fs';

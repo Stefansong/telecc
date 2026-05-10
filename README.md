@@ -1,6 +1,6 @@
 <div align="center">
 
-# urocc
+# telecc
 
 **Control Claude Code from Telegram — multi-session, Chinese-path-friendly.**
 
@@ -8,11 +8,11 @@
 
 ---
 
-`urocc` is a fork of [jsayubi/ccgram](https://github.com/jsayubi/ccgram) with patches focused on multi-project workflows, non-ASCII paths, and tighter session hygiene. All upstream features still work; the changes below are additive or replace clearly broken behavior.
+`telecc` is a fork of [jsayubi/ccgram](https://github.com/jsayubi/ccgram) with patches focused on multi-project workflows, non-ASCII paths, and tighter session hygiene. All upstream features still work; the changes below are additive or replace clearly broken behavior.
 
 ## What's different vs. upstream `ccgram`
 
-| Area | Upstream | urocc |
+| Area | Upstream | telecc |
 |---|---|---|
 | Path encoding for `getClaudeSessionsForProject` | replaces `/` only — fails on Chinese / underscore paths | replaces every non-`[a-zA-Z0-9.]` char (matches Claude Code) |
 | `/resume` (no arg) | lists all projects with history | scopes to the current default workspace |
@@ -27,30 +27,30 @@ See [CHANGELOG.md](CHANGELOG.md) for the upstream version history this fork is b
 
 ## Install
 
-The new binary and home dir are renamed (`ccgram` → `urocc`, `~/.ccgram` → `~/.urocc`):
+The new binary and home dir are renamed (`ccgram` → `telecc`, `~/.ccgram` → `~/.telecc`):
 
 ```bash
-git clone https://github.com/stefan-song/urocc.git
-cd urocc
+git clone https://github.com/stefan-song/telecc.git
+cd telecc
 npm install
 npm run build
 node dist/setup.js   # interactive wizard
 ```
 
-The wizard installs to `~/.urocc/`, generates `~/.urocc/.env`, and writes hooks to `~/.claude/settings.json` pointing at `~/.urocc/dist/`.
+The wizard installs to `~/.telecc/`, generates `~/.telecc/.env`, and writes hooks to `~/.claude/settings.json` pointing at `~/.telecc/dist/`.
 
 ## Service management
 
 ```bash
 # macOS
-launchctl kickstart -k gui/$(id -u)/com.urocc
+launchctl kickstart -k gui/$(id -u)/com.telecc
 
-# Linux (systemd template at urocc.service)
-sudo systemctl restart urocc
+# Linux (systemd template at telecc.service)
+sudo systemctl restart telecc
 
 # Logs
-tail -f ~/.urocc/logs/bot-stdout.log
-tail -f ~/.urocc/logs/bot-stderr.log
+tail -f ~/.telecc/logs/bot-stdout.log
+tail -f ~/.telecc/logs/bot-stderr.log
 ```
 
 ## Bot commands (forked + new)
@@ -72,7 +72,7 @@ tail -f ~/.urocc/logs/bot-stderr.log
 
 ## Configuration
 
-`~/.urocc/.env` (same fields as upstream `.ccgram/.env`):
+`~/.telecc/.env` (same fields as upstream `.ccgram/.env`):
 
 ```bash
 TELEGRAM_ENABLED=true

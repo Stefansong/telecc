@@ -324,9 +324,9 @@ class EmailListener extends EventEmitter {
     }
 
     _isReplyEmail(email: any): boolean {
-        // Check if subject contains urocc identifier
+        // Check if subject contains telecc identifier
         const subject: string = email.subject || '';
-        if (!subject.includes('[urocc')) {
+        if (!subject.includes('[telecc')) {
             return false;
         }
 
@@ -344,13 +344,13 @@ class EmailListener extends EventEmitter {
     _extractSessionId(email: any): string | null {
         // Extract from email headers
         const headers = email.headers;
-        if (headers && headers.get('x-urocc-session-id')) {
-            return headers.get('x-urocc-session-id');
+        if (headers && headers.get('x-telecc-session-id')) {
+            return headers.get('x-telecc-session-id');
         }
 
         // Extract token from subject line
         const subject: string = email.subject || '';
-        const tokenMatch = subject.match(/\[urocc #([A-Z0-9]{6,8})\]/);
+        const tokenMatch = subject.match(/\[telecc #([A-Z0-9]{6,8})\]/);
         if (tokenMatch) {
             const token = tokenMatch[1];
             // Look up session by token
