@@ -10,6 +10,7 @@ import { existsSync, readFileSync, writeFileSync, mkdirSync } from 'fs';
 import dotenv from 'dotenv';
 import { PROJECT_ROOT } from '../utils/paths';
 import { optionalRequire } from '../utils/optional-require';
+import { readJsonSafe } from '../utils/atomic-json';
 
 const envPath = path.join(PROJECT_ROOT, '.env');
 dotenv.config({ path: envPath });
@@ -28,24 +29,29 @@ interface LogMethods {
     error: (...args: unknown[]) => void;
 }
 
+/** mailparser address object: `value` holds the parsed addresses (groups nest). */
+interface ParsedAddress {
+    address?: string;
+    name?: string;
+    group?: ParsedAddress[];
+}
+
 interface ParsedEmail {
     uid?: number;
     messageId?: string;
     subject?: string;
     text?: string;
     date?: Date;
-    from?: { text?: string };
-}
-
-interface AutoPasteResult {
-    success: boolean;
-    method?: string;
-    error?: string;
+    from?: { text?: string; value?: ParsedAddress[] };
 }
 
 interface SessionEntry {
+    type?: string;
+    sessionType?: string;
     tmuxSession?: string;
+    tmuxPane?: string;
     expiresAt?: number;
+    endedAt?: number;
     [key: string]: unknown;
 }
 
@@ -137,22 +143,46 @@ function saveProcessedMessages(): void {
     }
 }
 
-// Load session mapping
+// Load session mapping (read-only; retries a file caught mid-write)
 function loadSessions(): Record<string, SessionEntry> {
-    if (!existsSync(SESS_PATH)) return {};
     try {
-        return JSON.parse(readFileSync(SESS_PATH, 'utf8'));
+        const map = readJsonSafe<Record<string, SessionEntry> | null>(SESS_PATH, {});
+        return map && typeof map === 'object' ? map : {};
     } catch (error: unknown) {
         log.error({ error }, 'Failed to load session map');
         return {};
     }
 }
 
-// Check if sender is in whitelist
-function isAllowed(fromAddress: string): boolean {
-    if (!fromAddress) return false;
-    const addr = fromAddress.toLowerCase();
-    return ALLOWED_SENDERS.some(allowed => addr.includes(allowed));
+/** All parsed mailbox addresses in a From header (lower-cased), including group members. */
+function extractSenderAddresses(from: ParsedEmail['from'] | undefined): string[] {
+    const out: string[] = [];
+    const walk = (list: ParsedAddress[] | undefined) => {
+        for (const entry of list || []) {
+            if (entry && typeof entry.address === 'string' && entry.address.trim()) {
+                out.push(entry.address.trim().toLowerCase());
+            }
+            if (entry && Array.isArray(entry.group)) walk(entry.group);
+        }
+    };
+    walk(from?.value);
+    return out;
+}
+
+/**
+ * Check if the sender is in the whitelist.
+ *
+ * Compares the *parsed* address(es) exactly (case-insensitive) — never a substring of
+ * `from.text`, which includes the display name: `"me@allowed.com" <attacker@evil.com>`
+ * used to pass. An ALLOWED_SENDERS entry starting with "@" allows a whole domain
+ * (exact domain match). Every From address must be allowed, and there must be one.
+ */
+function isAllowed(from: ParsedEmail['from'] | undefined, allowedSenders: string[] = ALLOWED_SENDERS): boolean {
+    const addresses = extractSenderAddresses(from);
+    if (addresses.length === 0 || allowedSenders.length === 0) return false;
+    return addresses.every(addr => allowedSenders.some(allowed =>
+        allowed.startsWith('@') ? addr.endsWith(allowed) && addr.indexOf('@') === addr.length - allowed.length : addr === allowed
+    ));
 }
 
 // Extract telecc token from subject
@@ -249,28 +279,44 @@ function cleanEmailText(text: string = ''): string {
     return deduplicateCommand(command);
 }
 
-// Deduplicate command text (handle cases like: "drink cola okay drink cola okay" -> "drink cola okay")
+/** A repeated unit shorter than this (in code points) is never collapsed: "11", "哈哈", "ok ok". */
+const DEDUP_MIN_UNIT_CHARS = 10;
+/** Max whitespace allowed between the two copies ("abc abc", "abc\nabc", "abc\r\n\r\nabc"). */
+const DEDUP_MAX_SEPARATOR = 4;
+
+/**
+ * Collapse a command that is exactly two copies of itself — what some mail clients
+ * produce when a long reply is pasted twice / the text part is duplicated, e.g.
+ * "please refactor the parser please refactor the parser" → "please refactor the parser".
+ *
+ * Deliberately conservative (the old version truncated "11" → "1", "哈哈" → "哈",
+ * "abab" → "ab"): only an exact 2× repetition, optionally separated by a little
+ * whitespace, of a unit that is at least DEDUP_MIN_UNIT_CHARS code points long and
+ * not itself a repetition of something shorter ("====…", "hahaha…" stay intact).
+ */
 function deduplicateCommand(command: string): string {
-    if (!command || command.length === 0) {
+    if (!command) {
         return command;
     }
 
-    // Check if command is self-repeating
-    const length = command.length;
-    for (let i = 1; i <= Math.floor(length / 2); i++) {
-        const firstPart = command.substring(0, i);
-        const remaining = command.substring(i);
+    const text = command.trim();
+    const n = text.length;
+    // Unit length L (UTF-16 units) with text = unit + sep + unit and sep whitespace-only
+    for (let sepLen = n % 2; sepLen <= DEDUP_MAX_SEPARATOR && sepLen < n; sepLen += 2) {
+        const unitLen = (n - sepLen) / 2;
+        const unit = text.slice(0, unitLen);
+        const sep = text.slice(unitLen, unitLen + sepLen);
+        const second = text.slice(unitLen + sepLen);
+        if (unit !== second || !/^\s*$/.test(sep)) continue;
+        if (Array.from(unit.trim()).length < DEDUP_MIN_UNIT_CHARS) continue;
+        // Primitive check: a unit that is itself periodic ("abab…") is left alone
+        if ((unit + unit).indexOf(unit, 1) !== unit.length) continue;
 
-        // Check if remaining part completely repeats the first part
-        if (remaining === firstPart.repeat(Math.floor(remaining.length / firstPart.length))) {
-            // Found repetition pattern, return first part
-            log.debug({
-                originalCommand: command,
-                deduplicatedCommand: firstPart,
-                pattern: firstPart
-            }, 'Detected and removed command duplication');
-            return firstPart;
-        }
+        log.debug({
+            originalCommand: command,
+            deduplicatedCommand: unit
+        }, 'Detected and removed command duplication');
+        return unit;
     }
 
     // No repetition detected, return original command
@@ -294,162 +340,55 @@ async function injectCommandRemote(token: string, command: string): Promise<bool
         return false;
     }
 
+    // A SessionEnd hook marked this session ended — Claude is gone
+    if (session.endedAt) {
+        log.warn({ token }, 'Session has ended');
+        return false;
+    }
+
     try {
         log.info({ token, command }, 'Starting remote command injection');
 
         // Method 1: Prefer tmux unattended injection
         const TmuxInjector = require('./tmux-injector');
         const tmuxSessionName = session.tmuxSession || 'claude-taskping';
-        const tmuxInjector = new TmuxInjector(log, tmuxSessionName);
+        const tmuxInjector = new TmuxInjector(log, tmuxSessionName, session.tmuxPane || null);
 
         const tmuxResult = await tmuxInjector.injectCommandFull(token, command);
 
         if (tmuxResult.success) {
             log.info({ token, session: tmuxResult.session }, 'Tmux remote injection successful');
             return true;
+        }
+
+        // A tmux-backed session whose tmux session is gone means Claude is gone: don't
+        // paste the command into whatever terminal happens to be in front instead.
+        const isTmuxSession = session.type === 'tmux' || session.sessionType === 'tmux';
+        if (isTmuxSession && tmuxResult.error === 'session_not_found') {
+            log.error({ token, tmuxSession: tmuxSessionName }, 'Target tmux session no longer exists — not injecting');
+            return false;
+        }
+
+        log.warn({ token, error: tmuxResult.error }, 'Tmux injection failed, trying smart fallback');
+
+        // Method 2: Fall back to smart injector
+        const SmartInjector = require('./smart-injector');
+        const smartInjector = new SmartInjector(log);
+
+        const smartResult = await smartInjector.injectCommand(token, command);
+
+        if (smartResult) {
+            log.info({ token }, 'Smart injection fallback successful');
+            return true;
         } else {
-            log.warn({ token, error: tmuxResult.error }, 'Tmux injection failed, trying smart fallback');
-
-            // Method 2: Fall back to smart injector
-            const SmartInjector = require('./smart-injector');
-            const smartInjector = new SmartInjector(log);
-
-            const smartResult = await smartInjector.injectCommand(token, command);
-
-            if (smartResult) {
-                log.info({ token }, 'Smart injection fallback successful');
-                return true;
-            } else {
-                log.error({ token }, 'All remote injection methods failed');
-                return false;
-            }
+            log.error({ token }, 'All remote injection methods failed');
+            return false;
         }
 
     } catch (error: unknown) {
         log.error({ error, token }, 'Failed to inject command remotely');
         return false;
     }
-}
-
-// Try automatic paste to active window
-async function tryAutoPaste(command: string): Promise<AutoPasteResult> {
-    return new Promise((resolve) => {
-        // First copy command to clipboard
-        const { spawn } = require('child_process');
-        const pbcopy = spawn('pbcopy');
-        pbcopy.stdin.write(command);
-        pbcopy.stdin.end();
-
-        pbcopy.on('close', (code: number) => {
-            if (code !== 0) {
-                resolve({ success: false, error: 'clipboard_copy_failed' });
-                return;
-            }
-
-            // Execute AppleScript auto-paste
-            const autoScript = `
-            tell application "System Events"
-                set claudeApps to {"Claude", "Claude Code", "Terminal", "iTerm2", "iTerm"}
-                set targetApp to null
-                set targetName to ""
-
-                repeat with appName in claudeApps
-                    try
-                        if application process appName exists then
-                            set targetApp to application process appName
-                            set targetName to appName
-                            exit repeat
-                        end if
-                    end try
-                end repeat
-
-                if targetApp is not null then
-                    set frontmost of targetApp to true
-                    delay 0.8
-
-                    repeat 10 times
-                        if frontmost of targetApp then exit repeat
-                        delay 0.1
-                    end repeat
-
-                    if targetName is in {"Terminal", "iTerm2", "iTerm"} then
-                        keystroke "${command.replace(/"/g, '\\"')}"
-                        delay 0.3
-                        keystroke return
-                        return "terminal_typed"
-                    else
-                        keystroke "a" using command down
-                        delay 0.2
-                        keystroke "v" using command down
-                        delay 0.5
-                        keystroke return
-                        return "claude_pasted"
-                    end if
-                else
-                    return "no_target_found"
-                end if
-            end tell
-            `;
-
-            const { exec } = require('child_process');
-            exec(`osascript -e '${autoScript}'`, (error: Error | null, stdout: string, _stderr: string) => {
-                if (error) {
-                    resolve({ success: false, error: error.message });
-                    return;
-                }
-
-                const result = stdout.trim();
-
-                switch(result) {
-                    case 'terminal_typed':
-                        resolve({ success: true, method: 'Terminal direct input' });
-                        break;
-                    case 'claude_pasted':
-                        resolve({ success: true, method: 'Claude app paste' });
-                        break;
-                    case 'no_target_found':
-                        resolve({ success: false, error: 'no_target_application' });
-                        break;
-                    default:
-                        resolve({ success: false, error: `unknown_result: ${result}` });
-                }
-            });
-        });
-    });
-}
-
-// Fallback to clipboard + strong reminder
-async function fallbackToClipboard(command: string): Promise<boolean> {
-    return new Promise((resolve) => {
-        // Copy to clipboard
-        const { spawn } = require('child_process');
-        const pbcopy = spawn('pbcopy');
-        pbcopy.stdin.write(command);
-        pbcopy.stdin.end();
-
-        pbcopy.on('close', (code: number) => {
-            if (code !== 0) {
-                resolve(false);
-                return;
-            }
-
-            // Send strong reminder notification
-            const shortCommand = command.length > 30 ? command.substring(0, 30) + '...' : command;
-            const notificationScript = `
-                display notification "\u{1f6a8} Email command auto-copied! Please paste and execute in Claude Code immediately (Cmd+V)" with title "TaskPing Auto-Injection" subtitle "${shortCommand.replace(/"/g, '\\"')}" sound name "Basso"
-            `;
-
-            const { exec } = require('child_process');
-            exec(`osascript -e '${notificationScript}'`, (error: Error | null) => {
-                if (error) {
-                    log.warn({ error: error.message }, 'Failed to send notification');
-                } else {
-                    log.info('Strong reminder notification sent');
-                }
-                resolve(true);
-            });
-        });
-    });
 }
 
 // Handle email message
@@ -487,9 +426,9 @@ async function handleMailMessage(parsed: ParsedEmail): Promise<void> {
             }
         }
 
-        // Verify sender
-        if (!isAllowed(parsed.from?.text || '')) {
-            log.warn({ from: parsed.from?.text }, 'Sender not allowed');
+        // Verify sender (parsed address, not the display text)
+        if (!isAllowed(parsed.from)) {
+            log.warn({ from: parsed.from?.text, addresses: extractSenderAddresses(parsed.from) }, 'Sender not allowed');
             return;
         }
 
@@ -816,4 +755,12 @@ if (require.main === module) {
     startImap();
 }
 
-export { startImap, handleMailMessage, extractTokenFromSubject, cleanEmailText };
+export {
+    startImap,
+    handleMailMessage,
+    extractTokenFromSubject,
+    cleanEmailText,
+    deduplicateCommand,
+    isAllowed,
+    extractSenderAddresses,
+};

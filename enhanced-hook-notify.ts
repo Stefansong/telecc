@@ -26,13 +26,16 @@ import path from 'path';
 import { PROJECT_ROOT } from './src/utils/paths';
 require('dotenv').config({ path: path.join(PROJECT_ROOT, '.env'), quiet: true });
 
-import https from 'https';
 import Logger from './src/core/logger';
-import { upsertSession, extractWorkspaceName, trackNotificationMessage, updateSessionRateLimit } from './workspace-router';
+import { upsertSession, extractWorkspaceName, trackNotificationMessage, updateSessionRateLimit, markSessionEnded } from './workspace-router';
 import type { RateLimitInfo } from './src/types';
 import { hasPendingForWorkspace } from './prompt-bridge';
-import { isUserActiveAtTerminal } from './src/utils/active-check';
-import type { TelegramMessage } from './src/types';
+import { isRemoteDriven, isLocallyActive } from './src/utils/active-check';
+import { endRemoteTurn, hookProjectDir } from './src/utils/remote-state';
+import {
+  routeConsoleToStderr, readStdin, escapeHtml, truncateText, fitHtml, markdownToHtml, htmlToPlain,
+  telegramSendMessage, stopTypingSignal, hookDeadline, remainingMs, detectSessionName,
+} from './src/utils/hook-utils';
 
 const logger = new Logger('hook:enhanced');
 
@@ -41,6 +44,13 @@ const CHAT_ID = process.env.TELEGRAM_CHAT_ID;
 const TELEGRAM_ENABLED = process.env.TELEGRAM_ENABLED === 'true';
 
 const STATUS_ARG = process.argv[2] || 'completed';
+
+/** Events that end a Telegram-driven turn — the only ones that call endRemoteTurn. */
+const ENDS_REMOTE_TURN = new Set(['completed', 'session-end', 'stop-failure']);
+/** Events after which the bot's "typing…" indicator should stop (once we've messaged). */
+const STOPS_TYPING = new Set(['completed', 'waiting', 'session-end', 'stop-failure']);
+/** SessionEnd reasons where the Claude process keeps running in the same pane. */
+const SESSION_END_STILL_RUNNING = new Set(['clear', 'resume']);
 
 // ── Status configuration ─────────────────────────────────────────
 
@@ -70,6 +80,9 @@ const STATUS_CONFIG: Record<string, StatusConfig> = {
 // ── Main ────────────────────────────────────────────────────────
 
 async function main(): Promise<void> {
+  routeConsoleToStderr();
+  const deadline = hookDeadline('enhanced-hook-notify.js', STATUS_ARG);
+
   let payload: Record<string, unknown>;
   try {
     const raw = await readStdin();
@@ -78,13 +91,39 @@ async function main(): Promise<void> {
     payload = {};
   }
 
-  const cwd = (payload.cwd as string) || process.env.CLAUDE_CWD || process.cwd();
-  const workspace = extractWorkspaceName(cwd)!;
+  // Key everything on the project root, not the shell's cwd: a `cd` into a
+  // subdirectory must not look like a new workspace/session or lose remote routing.
+  const dir = hookProjectDir((payload.cwd as string) || process.env.CLAUDE_CWD);
+  const workspace = extractWorkspaceName(dir)!;
   const sessionTitle = (payload.session_title as string) || null; // v2.1.94+
-  const tmuxSession = detectSessionName(cwd);
+  const tmuxSession = await detectSessionName(extractWorkspaceName(dir));
   const sessionId = (payload.session_id as string) || null;
 
   const config = STATUS_CONFIG[STATUS_ARG] ?? STATUS_CONFIG['waiting'];
+
+  // /clear and interactive /resume fire SessionEnd too, but Claude keeps running in the
+  // pane — that is not the end of the session for routing/injection purposes.
+  const claudeStillRunning = STATUS_ARG === 'session-end' && SESSION_END_STILL_RUNNING.has(payload.reason as string);
+
+  // Was the current turn of THIS session injected from Telegram? Read before clearing.
+  let remote = false;
+  try { remote = isRemoteDriven(dir); } catch {}
+  if (ENDS_REMOTE_TURN.has(STATUS_ARG) && !claudeStillRunning) {
+    try { endRemoteTurn(dir); } catch (err: unknown) {
+      logger.error(`Failed to end remote turn: ${(err as Error).message}`);
+    }
+  }
+
+  // Claude exited — the bot must never inject into this session again. The next
+  // SessionStart upsert (with tmuxPane) clears endedAt if Claude is started again.
+  if (STATUS_ARG === 'session-end' && !claudeStillRunning) {
+    try {
+      // Only the session that exited — another Claude may run in the same directory
+      markSessionEnded(dir, { sessionId, tmuxPane: process.env.TMUX_PANE });
+    } catch (err: unknown) {
+      logger.error(`Failed to mark session ended: ${(err as Error).message}`);
+    }
+  }
 
   // Extract rate limit info from payload (Claude Code v2.1.80+)
   const rateLimit = extractRateLimitInfo(payload);
@@ -97,8 +136,9 @@ async function main(): Promise<void> {
         : process.env.TERM_PROGRAM === 'ghostty' ? 'ghostty'
         : undefined;
       upsertSession({
-        cwd,
+        cwd: dir,
         tmuxSession: tmuxSession || `claude-${workspace}`,
+        tmuxPane: process.env.TMUX ? process.env.TMUX_PANE : undefined,
         status: STATUS_ARG,
         sessionId,
         sessionType,
@@ -114,14 +154,9 @@ async function main(): Promise<void> {
     } catch {}
   }
 
-  // If the bot injected this command from Telegram, typing-active exists — always notify
-  // so the response goes back to Telegram regardless of terminal activity.
-  const typingActivePath = path.join(PROJECT_ROOT, 'src/data', 'typing-active');
-  const isTelegramInjected = fs.existsSync(typingActivePath);
-
-  // Suppress notification if user is actively at terminal AND this wasn't Telegram-injected
-  if (!config.alwaysNotify && !isTelegramInjected && isUserActiveAtTerminal()) {
-    try { fs.unlinkSync(typingActivePath); } catch {}
+  // Suppress if the user is working in THIS session at the terminal, unless the turn
+  // was injected from Telegram (then the result must go back to Telegram).
+  if (!config.alwaysNotify && !remote && isLocallyActive(dir)) {
     return;
   }
 
@@ -130,13 +165,12 @@ async function main(): Promise<void> {
     // Dedup: if a richer prompt (permission/question) is already pending for this
     // workspace, skip the basic "Waiting for input" notification
     if (STATUS_ARG === 'waiting' && hasPendingForWorkspace(workspace)) {
-      try { fs.unlinkSync(typingActivePath); } catch {}
       return;
     }
 
     // Include session title if available (v2.1.94+)
-    const titleSuffix = sessionTitle ? ` (${escapeHtml(sessionTitle)})` : '';
-    let message = `${config.icon} ${config.label} in <b>${escapeHtml(workspace)}</b>${titleSuffix}`;
+    const titleSuffix = sessionTitle ? ` (${escapeHtml(truncateText(sessionTitle, 100))})` : '';
+    let message = `${config.icon} ${config.label} in <b>${escapeHtml(truncateText(workspace, 100))}</b>${titleSuffix}`;
 
     // Status-specific message additions
     if (STATUS_ARG === 'stop-failure') {
@@ -144,9 +178,9 @@ async function main(): Promise<void> {
       const errorType = payload.error_type as string | undefined;
       const errorMessage = payload.error_message as string | undefined;
       if (errorType || errorMessage) {
-        message += `\n\n<b>Error:</b> ${escapeHtml(errorType || 'Unknown')}`;
+        message += `\n\n<b>Error:</b> ${escapeHtml(truncateText(errorType || 'Unknown', 200))}`;
         if (errorMessage) {
-          message += `\n${escapeHtml(errorMessage)}`;
+          message += `\n${escapeHtml(truncateText(errorMessage, 1000))}`;
         }
       }
     } else if (STATUS_ARG === 'post-compact') {
@@ -163,10 +197,10 @@ async function main(): Promise<void> {
       const taskDescription = payload.task_description as string | undefined;
       const taskId = payload.task_id as string | undefined;
       if (taskDescription) {
-        message += `\n\n${escapeHtml(taskDescription)}`;
+        message += `\n\n${escapeHtml(truncateText(taskDescription, 1000))}`;
       }
       if (taskId) {
-        message += `\n<i>ID: ${escapeHtml(taskId)}</i>`;
+        message += `\n<i>ID: ${escapeHtml(truncateText(taskId, 100))}</i>`;
       }
     } else if (STATUS_ARG === 'cwd-changed') {
       // Include old and new directory
@@ -175,41 +209,40 @@ async function main(): Promise<void> {
       if (oldCwd && newCwd) {
         const oldWorkspace = extractWorkspaceName(oldCwd);
         const newWorkspace = extractWorkspaceName(newCwd);
-        message += `\n\n<i>${escapeHtml(oldWorkspace || oldCwd)} → ${escapeHtml(newWorkspace || newCwd)}</i>`;
+        message += `\n\n<i>${escapeHtml(truncateText(oldWorkspace || oldCwd, 300))} → ${escapeHtml(truncateText(newWorkspace || newCwd, 300))}</i>`;
       }
     } else if (STATUS_ARG === 'instructions-loaded') {
       // Include instructions file path
       const instructionsPath = payload.instructions_path as string | undefined;
       if (instructionsPath) {
-        message += `\n\n<i>${escapeHtml(instructionsPath)}</i>`;
+        message += `\n\n<i>${escapeHtml(truncateText(instructionsPath, 300))}</i>`;
       }
     }
 
     // Append Claude's last response text (skip for session-start and simple notifications)
     const skipResponseText = ['session-start', 'post-compact', 'task-created', 'cwd-changed', 'instructions-loaded'];
-    if (!skipResponseText.includes(STATUS_ARG)) {
-      const responseText = getResponseText(payload);
-      if (responseText) {
-        const truncated = responseText.length > 3500
-          ? responseText.slice(0, 3497) + '...'
-          : responseText;
-        message += `\n\n${markdownToHtml(truncated)}`;
-      }
-    }
+    const responseText = skipResponseText.includes(STATUS_ARG) ? null : getResponseText(payload);
+    const head = message;
+    // Truncate the RAW response before converting, shrinking until the message fits 4096
+    message = fitHtml(
+      budget => responseText ? `${head}\n\n${markdownToHtml(truncateText(responseText, budget))}` : head,
+      3500,
+    );
 
-    // Remove typing signal file BEFORE sending
-    try { fs.unlinkSync(typingActivePath); } catch {}
-
+    const timeoutFor = (): number => Math.min(5000, remainingMs(deadline));
+    let sent = false;
     try {
-      const result = await sendTelegram(message, 'HTML');
+      const result = await telegramSendMessage(message, { parseMode: 'HTML', timeoutMs: Math.max(300, timeoutFor()) });
+      sent = true;
       if (result && result.message_id) {
         trackNotificationMessage(result.message_id, workspace, `hook-${STATUS_ARG}`);
       }
-    } catch {
-      // HTML failed — send as plain text
+    } catch (err: unknown) {
+      logger.error(`HTML send failed (${(err as Error).message}) — retrying as plain text`);
+      // HTML failed — send as plain text (tags stripped, entities decoded)
       try {
-        const plain = message.replace(/<[^>]+>/g, '');
-        const result = await sendTelegram(plain, false);
+        const result = await telegramSendMessage(htmlToPlain(message), { timeoutMs: Math.max(300, timeoutFor()) });
+        sent = true;
         if (result && result.message_id) {
           trackNotificationMessage(result.message_id, workspace, `hook-${STATUS_ARG}`);
         }
@@ -217,6 +250,10 @@ async function main(): Promise<void> {
         logger.error(`Telegram send failed: ${(err2 as Error).message}`);
       }
     }
+
+    // typing-active is only the bot's typing indicator: stop it once the turn's result
+    // (or a request for input) has actually been delivered.
+    if (sent && STOPS_TYPING.has(STATUS_ARG)) stopTypingSignal();
   }
 }
 
@@ -242,53 +279,6 @@ function getResponseText(payload: Record<string, unknown>): string | null {
     try { return extractLastResponse(transcript); } catch {}
   }
   return null;
-}
-
-// ── Telegram ────────────────────────────────────────────────────
-
-function sendTelegram(text: string, parseMode: string | false = 'Markdown'): Promise<TelegramMessage | null> {
-  return new Promise((resolve, reject) => {
-    const msgPayload: Record<string, unknown> = { chat_id: CHAT_ID, text };
-    if (parseMode) msgPayload.parse_mode = parseMode;
-    const body = JSON.stringify(msgPayload);
-
-    const options: https.RequestOptions = {
-      hostname: 'api.telegram.org',
-      path: `/bot${BOT_TOKEN}/sendMessage`,
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        'Content-Length': Buffer.byteLength(body),
-      },
-      timeout: 5000,
-    };
-
-    const req = https.request(options, (res) => {
-      let data = '';
-      res.on('data', (chunk: string) => { data += chunk; });
-      res.on('end', () => {
-        if (res.statusCode! >= 200 && res.statusCode! < 300) {
-          try {
-            const parsed = JSON.parse(data);
-            resolve(parsed.result || null);
-          } catch {
-            resolve(null);
-          }
-        } else {
-          reject(new Error(`Telegram API ${res.statusCode}: ${data}`));
-        }
-      });
-    });
-
-    req.on('error', reject);
-    req.on('timeout', () => {
-      req.destroy();
-      reject(new Error('Telegram request timed out'));
-    });
-
-    req.write(body);
-    req.end();
-  });
 }
 
 // ── Helpers ──────────────────────────────────────────────────────
@@ -339,76 +329,6 @@ function extractLastResponse(transcriptPath: string): string | null {
     } catch {}
   }
   return null;
-}
-
-function readStdin(): Promise<string> {
-  return new Promise((resolve) => {
-    let data = '';
-    let resolved = false;
-    process.stdin.setEncoding('utf8');
-    process.stdin.on('data', (chunk: string) => { data += chunk; });
-    process.stdin.on('end', () => {
-      if (!resolved) { resolved = true; resolve(data); }
-    });
-
-    setTimeout(() => {
-      if (!resolved) {
-        resolved = true;
-        process.stdin.destroy();
-        resolve(data || '{}');
-      }
-    }, 500);
-  });
-}
-
-function detectSessionName(cwd: string): string | null {
-  // 1. Try tmux (preferred — gives actual session name)
-  if (process.env.TMUX) {
-    try {
-      const { execSync } = require('child_process');
-      return execSync('tmux display-message -p "#S"', { encoding: 'utf8' }).trim();
-    } catch {}
-  }
-  // 2. Ghostty — derive from CWD (same sanitization as tmux-less path)
-  if (process.env.TERM_PROGRAM === 'ghostty') {
-    const raw = extractWorkspaceName(cwd);
-    return raw ? raw.replace(/[.:\s]/g, '-') : null;
-  }
-  // 3. Derive from CWD — sanitize so it matches PTY handle key format
-  const raw = extractWorkspaceName(cwd);
-  if (!raw) return null;
-  return raw.replace(/[.:\s]/g, '-');
-}
-
-function escapeHtml(text: string): string {
-  return text.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
-}
-
-function markdownToHtml(text: string): string {
-  let html = escapeHtml(text);
-  const placeholders: string[] = [];
-
-  // Extract code blocks/inline code first to protect them from bold/italic regexes
-  html = html.replace(/```(\w*)\n([\s\S]*?)```/g, (_: string, __: string, code: string) => {
-    const idx = placeholders.length;
-    placeholders.push(`<pre>${code.trim()}</pre>`);
-    return `\x00P${idx}\x00`;
-  });
-  html = html.replace(/`([^`]+)`/g, (_: string, code: string) => {
-    const idx = placeholders.length;
-    placeholders.push(`<code>${code}</code>`);
-    return `\x00P${idx}\x00`;
-  });
-
-  // Apply inline formatting only to non-code text
-  html = html.replace(/\*\*(.+?)\*\*/g, '<b>$1</b>');
-  html = html.replace(/\*(.+?)\*/g, '<i>$1</i>');
-  html = html.replace(/^[-*]\s+/gm, '\u2022 ');
-  html = html.replace(/^#{1,6}\s+/gm, '');
-
-  // Restore code placeholders
-  html = html.replace(/\x00P(\d+)\x00/g, (_: string, idx: string) => placeholders[parseInt(idx)]);
-  return html;
 }
 
 // ── Run ─────────────────────────────────────────────────────────

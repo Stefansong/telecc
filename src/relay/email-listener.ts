@@ -21,7 +21,27 @@ interface EmailListenerConfig {
     };
     sentMessagesPath?: string;
     template?: { checkInterval?: number };
+    /** Allowed sender addresses ("@domain" allows a domain); defaults to ALLOWED_SENDERS env. */
+    allowedSenders?: string[];
     [key: string]: unknown;
+}
+
+interface ParsedAddress {
+    address?: string;
+    group?: ParsedAddress[];
+}
+
+/** Parsed From addresses (mailparser `from.value`, groups flattened), lower-cased. */
+function senderAddresses(from: { value?: ParsedAddress[] } | undefined): string[] {
+    const out: string[] = [];
+    const walk = (list: ParsedAddress[] | undefined) => {
+        for (const entry of list || []) {
+            if (entry && typeof entry.address === 'string' && entry.address.trim()) out.push(entry.address.trim().toLowerCase());
+            if (entry && Array.isArray(entry.group)) walk(entry.group);
+        }
+    };
+    walk(from?.value);
+    return out;
 }
 
 interface SessionData {
@@ -48,6 +68,7 @@ class EmailListener extends EventEmitter {
     sentMessagesPath: string;
     checkInterval: number;
     lastCheckTime: Date;
+    allowedSenders: string[];
 
     constructor(config: EmailListenerConfig) {
         super();
@@ -60,6 +81,9 @@ class EmailListener extends EventEmitter {
         this.sentMessagesPath = config.sentMessagesPath || path.join(__dirname, '../data/sent-messages.json');
         this.checkInterval = (config.template?.checkInterval || 30) * 1000; // Convert to milliseconds
         this.lastCheckTime = new Date();
+        this.allowedSenders = (config.allowedSenders || (process.env.ALLOWED_SENDERS || '').split(','))
+            .map(s => s.trim().toLowerCase())
+            .filter(Boolean);
 
         this._ensureDirectories();
     }
@@ -267,6 +291,12 @@ class EmailListener extends EventEmitter {
                 return;
             }
 
+            // Verify sender: exact parsed address(es), never a substring of the display text
+            if (!this._isSenderAllowed(email)) {
+                this.logger.warn(`Email ${seqno} from non-allowed sender: ${email.from?.text}`);
+                return;
+            }
+
             // Check if it's a reply email
             if (!this._isReplyEmail(email)) {
                 this.logger.debug(`Email ${seqno} is not a TaskPing reply`);
@@ -323,6 +353,15 @@ class EmailListener extends EventEmitter {
         }
     }
 
+    /** Every From address must be allowed (exact, case-insensitive; "@domain" entries match the domain). Fails closed. */
+    _isSenderAllowed(email: any): boolean {
+        const addresses = senderAddresses(email?.from);
+        if (addresses.length === 0 || this.allowedSenders.length === 0) return false;
+        return addresses.every(addr => this.allowedSenders.some(allowed =>
+            allowed.startsWith('@') ? addr.endsWith(allowed) && addr.indexOf('@') === addr.length - allowed.length : addr === allowed
+        ));
+    }
+
     _isReplyEmail(email: any): boolean {
         // Check if subject contains telecc identifier
         const subject: string = email.subject || '';
@@ -344,8 +383,10 @@ class EmailListener extends EventEmitter {
     _extractSessionId(email: any): string | null {
         // Extract from email headers
         const headers = email.headers;
-        if (headers && headers.get('x-telecc-session-id')) {
-            return headers.get('x-telecc-session-id');
+        const headerId = headers && headers.get('x-telecc-session-id');
+        if (headerId) {
+            // Used as a file name under sessionsDir — reject anything but a plain id (no ../)
+            return typeof headerId === 'string' && /^[A-Za-z0-9-]{1,64}$/.test(headerId) ? headerId : null;
         }
 
         // Extract token from subject line

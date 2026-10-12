@@ -211,16 +211,22 @@ class ClaudeCodeRemoteCLI {
 
     async captureCurrentConversation(): Promise<ConversationMetadata> {
         try {
-            const { execSync } = require('child_process');
+            const { execFileSync } = require('child_process');
             const TmuxMonitor = require('./src/utils/tmux-monitor') as any;
 
-            // Get current tmux session name
+            // Get current tmux session name — of the pane this process runs in
+            // ($TMUX_PANE), not whichever client happens to be active
             let currentSession: string | null = null;
             try {
-                currentSession = execSync('tmux display-message -p "#S"', {
+                const paneId = process.env.TMUX_PANE;
+                const args = paneId && /^%\d+$/.test(paneId)
+                    ? ['display-message', '-p', '-t', paneId, '#S']
+                    : ['display-message', '-p', '#S'];
+                currentSession = (execFileSync('tmux', args, {
                     encoding: 'utf8',
-                    stdio: ['ignore', 'pipe', 'ignore']
-                }).trim();
+                    stdio: ['ignore', 'pipe', 'ignore'],
+                    timeout: 5000
+                }) as string).trim();
             } catch (e: unknown) {
                 // Not running in tmux, return empty metadata
                 return {};

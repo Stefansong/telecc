@@ -7,6 +7,9 @@
  * user selection, then outputs `updatedInput` via stdout so Claude Code receives
  * the answer directly — no keystroke injection needed!
  *
+ * Free-text questions (no options): the pending prompt is marked `awaitingText` with the
+ * Telegram message id; the bot writes `{ textAnswer }` when the user replies.
+ *
  * This works with ANY terminal (tmux, Ghostty, bare terminal).
  *
  * Stdin JSON: { tool_name, tool_input, cwd, session_id, hook_event_name }
@@ -19,19 +22,18 @@ import path from 'path';
 import { PROJECT_ROOT } from './src/utils/paths';
 require('dotenv').config({ path: path.join(PROJECT_ROOT, '.env'), quiet: true });
 
-import fs from 'fs';
-import https from 'https';
 import { extractWorkspaceName, trackNotificationMessage } from './workspace-router';
-import { generatePromptId, writePending, readResponse, cleanPrompt, PROMPTS_DIR } from './prompt-bridge';
-import { isUserActiveAtTerminal } from './src/utils/active-check';
-import type { AskUserQuestionItem, InlineKeyboardMarkup, InlineKeyboardButton, TelegramMessage } from './src/types';
+import { generatePromptId, updatePending } from './prompt-bridge';
+import { shouldDeferToTerminal, hookProjectDir } from './src/utils/active-check';
+import {
+  routeConsoleToStderr, readStdin, parsePayload, emitJson, logErr,
+  escapeHtml, truncateText, fitHtml, sendHtmlWithFallback, stopTypingSignal,
+  hookDeadline, openPrompt, closePrompt, closeAllPrompts, installPromptCleanup, pollForResponse,
+  detectSessionName, telegramConfigured,
+} from './src/utils/hook-utils';
+import type { AskUserQuestionItem, InlineKeyboardButton } from './src/types';
 
-const BOT_TOKEN = process.env.TELEGRAM_BOT_TOKEN;
-const CHAT_ID = process.env.TELEGRAM_CHAT_ID;
-
-// Polling configuration (same as permission-hook.ts)
-const POLL_INTERVAL_MS = 500;
-const POLL_TIMEOUT_MS = 90000; // 90 seconds
+const TAG = 'question-notify';
 
 /** Output format for Claude Code's PreToolUse hook with updatedInput.
  *
@@ -56,157 +58,165 @@ interface QuestionHookOutput {
 // ── Main ────────────────────────────────────────────────────────
 
 async function main(): Promise<void> {
+  routeConsoleToStderr();
+  installPromptCleanup(TAG);
+  // ONE deadline shared by every question in this tool call
+  const deadline = hookDeadline('question-notify.js');
+
   const raw = await readStdin();
+  // Telegram off / not configured — no output, Claude Code shows its native UI
+  if (!telegramConfigured()) return;
+  const payload = parsePayload(raw);
+  if (!payload) return;
 
-  // Skip Telegram notification if user is at terminal AND this wasn't Telegram-injected.
-  // If the command came from Telegram, the question must go back to Telegram.
-  const typingActivePath = path.join(PROJECT_ROOT, 'src/data', 'typing-active');
-  const isTelegramInjected = fs.existsSync(typingActivePath);
-  if (!isTelegramInjected && isUserActiveAtTerminal()) {
-    // User is at terminal — let Claude Code show its native UI
-    return;
-  }
+  // Key everything on the project root (stable when Claude cd's into a subdirectory)
+  const dir = hookProjectDir(payload.cwd as string);
 
-  let payload: Record<string, unknown>;
-  try {
-    payload = JSON.parse(raw);
-  } catch {
+  // User is working in this session at the terminal and the turn didn't come from
+  // Telegram — let Claude Code show its native UI. Telegram-driven questions must go
+  // back to Telegram.
+  if (shouldDeferToTerminal(dir)) {
     return;
   }
 
   const toolInput = (payload.tool_input || {}) as Record<string, unknown>;
-  const cwd = (payload.cwd as string) || process.cwd();
-  const workspace = extractWorkspaceName(cwd)!;
+  const workspace = extractWorkspaceName(dir) || 'unknown';
 
   // Extract questions from tool_input
   const questions = (toolInput.questions || []) as AskUserQuestionItem[];
-  if (questions.length === 0) {
+  if (!Array.isArray(questions) || questions.length === 0) {
     return;
   }
 
   // Detect session name (for session map, even though we don't inject keystrokes)
-  const tmuxSession = detectSessionName(cwd);
+  const tmuxSession = await detectSessionName(extractWorkspaceName(dir));
 
   // Collect answers: map of question text → selected label(s)
   // Multi-select: join labels with commas (Claude Code format).
   const answers: Record<string, string> = {};
 
-  // Process each question (usually just one)
-  for (let qi = 0; qi < questions.length; qi++) {
-    const q = questions[qi];
-    const promptId = generatePromptId(); // Unique ID per question
-    const questionText = q.question || 'Question';
-    const options = q.options || [];
-    const isLast = qi === questions.length - 1;
-    const isMultiSelect = q.multiSelect || false;
+  // The previous question's prompt stays until the next one is written, so a free-text
+  // reply never finds "no open question" in between. All are removed on exit.
+  let prevPromptId: string | null = null;
+  try {
+    // Process each question (usually just one)
+    for (let qi = 0; qi < questions.length; qi++) {
+      const q = questions[qi];
+      const promptId = generatePromptId(); // Unique ID per question
+      const questionText = q.question || 'Question';
+      const options = Array.isArray(q.options) ? q.options : [];
+      const isLast = qi === questions.length - 1;
+      const isMultiSelect = q.multiSelect || false;
+      const isFreeText = options.length === 0;
+      const counter = questions.length > 1 ? ` (${qi + 1}/${questions.length})` : '';
 
-    let messageText = `\u2753 *Question* — ${escapeMarkdown(workspace)}\n\n${escapeMarkdown(questionText)}`;
+      const head = `❓ <b>Question${counter}</b> — ${escapeHtml(truncateText(workspace, 100))}`;
+      let keyboard: InlineKeyboardButton[][] | null = null;
+      let messageText: string;
 
-    if (options.length > 0) {
-      // Build inline keyboard with numbered options
-      const prefix = isMultiSelect ? '\u2610 ' : '';
-      const buttons: InlineKeyboardButton[] = options.map((opt, idx) => ({
-        text: `${prefix}${idx + 1}. ${opt.label}`,
-        callback_data: `opt:${promptId}:${idx + 1}`,
-      }));
+      if (!isFreeText) {
+        // Build inline keyboard with numbered options
+        const prefix = isMultiSelect ? '☐ ' : '';
+        const buttons: InlineKeyboardButton[] = options.map((opt, idx) => ({
+          text: truncateText(`${prefix}${idx + 1}. ${opt.label}`, 60),
+          callback_data: `opt:${promptId}:${idx + 1}`,
+        }));
 
-      // Arrange buttons in rows (max 2 per row for readability)
-      const keyboard: InlineKeyboardButton[][] = [];
-      for (let i = 0; i < buttons.length; i += 2) {
-        keyboard.push(buttons.slice(i, i + 2));
-      }
-      // Add Submit button for multi-select questions
-      if (isMultiSelect) {
-        keyboard.push([{ text: '\u2705 Submit', callback_data: `opt-submit:${promptId}` }]);
-      }
-
-      // Add option descriptions to the message
-      const optionLines = options.map((opt, idx) =>
-        `*${idx + 1}.* ${escapeMarkdown(opt.label)}${opt.description ? ` — _${escapeMarkdown(opt.description)}_` : ''}`
-      );
-      messageText += '\n\n' + optionLines.join('\n');
-
-      // Write pending file so bot callback handler can write response
-      writePending(promptId, {
-        type: 'question',
-        workspace,
-        tmuxSession,
-        questionText,
-        options: options.map(o => o.label),
-        multiSelect: isMultiSelect,
-        selectedOptions: isMultiSelect ? options.map(() => false) : undefined,
-        isLast,
-      });
-
-      // Send Telegram message with inline keyboard
-      try {
-        const result = await sendTelegramWithKeyboard(messageText, { inline_keyboard: keyboard });
-        if (result && result.message_id) {
-          trackNotificationMessage(result.message_id, workspace, 'question');
+        // Arrange buttons in rows (max 2 per row for readability)
+        keyboard = [];
+        for (let i = 0; i < buttons.length; i += 2) {
+          keyboard.push(buttons.slice(i, i + 2));
         }
-      } catch (err: unknown) {
-        process.stderr.write(`[question-notify] Telegram send failed: ${(err as Error).message}\n`);
-        cleanPrompt(promptId);
-        return; // Can't notify — exit without output
-      }
-
-      // Poll for response
-      const response = await pollForResponse(promptId);
-
-      if (response) {
-        // Extract answer from response
+        // Add Submit button for multi-select questions
         if (isMultiSelect) {
-          // Multi-select: response.selectedLabels is string[] — join with commas
-          const selectedLabels = (response.selectedLabels as string[]) || [];
-          answers[questionText] = selectedLabels.join(',');
-        } else {
-          // Single-select: response.selectedLabel is string
-          const selectedLabel = (response.selectedLabel as string) || '';
-          answers[questionText] = selectedLabel;
+          keyboard.push([{ text: '✅ Submit', callback_data: `opt-submit:${promptId}` }]);
         }
+
+        messageText = fitHtml(budget => {
+          let html = `${head}\n\n${escapeHtml(truncateText(questionText, budget))}`;
+          // Add option descriptions to the message
+          const optionLines = options.map((opt, idx) =>
+            `<b>${idx + 1}.</b> ${escapeHtml(truncateText(opt.label || '', 200))}`
+            + (opt.description ? ` — <i>${escapeHtml(truncateText(opt.description, Math.max(40, Math.floor(budget / 4))))}</i>` : '')
+          );
+          html += '\n\n' + optionLines.join('\n');
+          if (isMultiSelect) html += '\n\n<i>Select one or more, then tap Submit.</i>';
+          return html;
+        }, 2500);
+
+        // Write pending file so bot callback handler can write response
+        openPrompt(promptId, {
+          type: 'question',
+          workspace,
+          tmuxSession,
+          questionText,
+          options: options.map(o => o.label),
+          multiSelect: isMultiSelect,
+          selectedOptions: isMultiSelect ? options.map(() => false) : undefined,
+          isLast,
+        });
       } else {
-        // Timed out — exit without output (Claude Code will show native UI on retry)
-        cleanPrompt(promptId);
-        return;
+        // No options — free text question, answered by replying in Telegram
+        messageText = fitHtml(budget =>
+          `${head}\n\n${escapeHtml(truncateText(questionText, budget))}\n\n`
+          + '<i>Reply to this message with your answer (or just send it as a message if this is the only open question).</i>',
+        3000);
+
+        // awaitingText from the start: a reply that arrives before messageId is
+        // recorded must still be routable to this prompt
+        openPrompt(promptId, {
+          type: 'question-freetext',
+          workspace,
+          tmuxSession,
+          questionText,
+          isLast,
+          awaitingText: true,
+        });
       }
+      if (prevPromptId) closePrompt(prevPromptId);
+      prevPromptId = promptId;
 
-      cleanPrompt(promptId);
-    } else {
-      // No options — free text question
-      messageText += `\n\n_Reply to this message with your answer_`;
-
-      writePending(promptId, {
-        type: 'question-freetext',
-        workspace,
-        tmuxSession,
-        questionText,
-        isLast,
-      });
-
+      // Send Telegram message (HTML, plain-text retry on failure)
       try {
-        const result = await sendTelegram(messageText);
-        if (result && result.message_id) {
-          trackNotificationMessage(result.message_id, workspace, 'question-freetext');
-        }
+        const result = await sendHtmlWithFallback(messageText, {
+          tag: TAG,
+          replyMarkup: keyboard
+            ? { inline_keyboard: keyboard }
+            : { force_reply: true, input_field_placeholder: truncateText(questionText, 64) },
+          deadlineMs: deadline,
+        });
+        const messageId = result?.message_id;
+        // Record the message id first (reply-to routing) — trackNotificationMessage
+        // can wait on a file lock
+        if (messageId) updatePending(promptId, { messageId });
+        stopTypingSignal();
+        if (messageId) trackNotificationMessage(messageId, workspace, isFreeText ? 'question-freetext' : 'question');
       } catch (err: unknown) {
-        process.stderr.write(`[question-notify] Telegram send failed: ${(err as Error).message}\n`);
-        cleanPrompt(promptId);
+        logErr(TAG, `Telegram send failed: ${(err as Error).message}`);
+        return; // Can't notify — exit without output (Claude Code shows its native UI)
+      }
+
+      // Poll for response until the shared deadline
+      const response = await pollForResponse(promptId, deadline);
+      if (!response) {
+        // Timed out — exit without output (Claude Code shows its native UI)
+        logErr(TAG, 'Timed out waiting for response');
         return;
       }
 
-      // Poll for response
-      const response = await pollForResponse(promptId);
-
-      if (response) {
-        const textAnswer = (response.textAnswer as string) || '';
-        answers[questionText] = textAnswer;
+      if (typeof response.textAnswer === 'string') {
+        answers[questionText] = response.textAnswer;
+      } else if (isMultiSelect) {
+        // Multi-select: response.selectedLabels is string[] — join with commas
+        const selectedLabels = (response.selectedLabels as string[]) || [];
+        answers[questionText] = selectedLabels.join(',');
       } else {
-        cleanPrompt(promptId);
-        return;
+        // Single-select: response.selectedLabel is string
+        answers[questionText] = (response.selectedLabel as string) || '';
       }
-
-      cleanPrompt(promptId);
     }
+  } finally {
+    closeAllPrompts();
   }
 
   // Output updatedInput to stdout so Claude Code receives the answers directly.
@@ -222,185 +232,12 @@ async function main(): Promise<void> {
         },
       },
     };
-    process.stdout.write(JSON.stringify(output) + '\n');
+    emitJson(output);
   }
-}
-
-// ── Polling ─────────────────────────────────────────────────────
-
-function pollForResponse(promptId: string): Promise<Record<string, unknown> | null> {
-  return new Promise((resolve) => {
-    const responseFile = path.join(PROMPTS_DIR, `response-${promptId}.json`);
-    const startTime = Date.now();
-
-    const interval = setInterval(() => {
-      // Check timeout
-      if (Date.now() - startTime > POLL_TIMEOUT_MS) {
-        clearInterval(interval);
-        process.stderr.write(`[question-notify] Timed out waiting for response\n`);
-        resolve(null);
-        return;
-      }
-
-      // Check for response file
-      try {
-        if (fs.existsSync(responseFile)) {
-          const raw = fs.readFileSync(responseFile, 'utf8');
-          const data = JSON.parse(raw);
-          clearInterval(interval);
-          resolve(data);
-        }
-      } catch {
-        // File not ready yet or parse error — keep polling
-      }
-    }, POLL_INTERVAL_MS);
-  });
-}
-
-// ── Telegram ────────────────────────────────────────────────────
-
-function sendTelegramWithKeyboard(text: string, replyMarkup: InlineKeyboardMarkup): Promise<TelegramMessage | null> {
-  return new Promise((resolve, reject) => {
-    const body = JSON.stringify({
-      chat_id: CHAT_ID,
-      text,
-      parse_mode: 'Markdown',
-      reply_markup: replyMarkup,
-    });
-
-    const options: https.RequestOptions = {
-      hostname: 'api.telegram.org',
-      path: `/bot${BOT_TOKEN}/sendMessage`,
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        'Content-Length': Buffer.byteLength(body),
-      },
-      timeout: 5000,
-    };
-
-    const req = https.request(options, (res) => {
-      let data = '';
-      res.on('data', (chunk: string) => { data += chunk; });
-      res.on('end', () => {
-        if (res.statusCode! >= 200 && res.statusCode! < 300) {
-          try {
-            const parsed = JSON.parse(data);
-            resolve(parsed.result || null);
-          } catch {
-            resolve(null);
-          }
-        } else {
-          reject(new Error(`Telegram API ${res.statusCode}: ${data}`));
-        }
-      });
-    });
-
-    req.on('error', reject);
-    req.on('timeout', () => {
-      req.destroy();
-      reject(new Error('Telegram request timed out'));
-    });
-
-    req.write(body);
-    req.end();
-  });
-}
-
-function sendTelegram(text: string): Promise<TelegramMessage | null> {
-  return new Promise((resolve, reject) => {
-    const body = JSON.stringify({
-      chat_id: CHAT_ID,
-      text,
-      parse_mode: 'Markdown',
-    });
-
-    const options: https.RequestOptions = {
-      hostname: 'api.telegram.org',
-      path: `/bot${BOT_TOKEN}/sendMessage`,
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        'Content-Length': Buffer.byteLength(body),
-      },
-      timeout: 5000,
-    };
-
-    const req = https.request(options, (res) => {
-      let data = '';
-      res.on('data', (chunk: string) => { data += chunk; });
-      res.on('end', () => {
-        if (res.statusCode! >= 200 && res.statusCode! < 300) {
-          try {
-            const parsed = JSON.parse(data);
-            resolve(parsed.result || null);
-          } catch {
-            resolve(null);
-          }
-        } else {
-          reject(new Error(`Telegram API ${res.statusCode}: ${data}`));
-        }
-      });
-    });
-
-    req.on('error', reject);
-    req.on('timeout', () => {
-      req.destroy();
-      reject(new Error('Telegram request timed out'));
-    });
-
-    req.write(body);
-    req.end();
-  });
-}
-
-// ── Helpers ──────────────────────────────────────────────────────
-
-function readStdin(): Promise<string> {
-  return new Promise((resolve) => {
-    let data = '';
-    let resolved = false;
-    process.stdin.setEncoding('utf8');
-    process.stdin.on('data', (chunk: string) => { data += chunk; });
-    process.stdin.on('end', () => {
-      if (!resolved) { resolved = true; resolve(data); }
-    });
-    setTimeout(() => {
-      if (!resolved) {
-        resolved = true;
-        process.stdin.destroy();
-        resolve(data || '{}');
-      }
-    }, 500);
-  });
-}
-
-function detectSessionName(cwd: string): string | null {
-  // 1. Try tmux (existing behaviour)
-  if (process.env.TMUX) {
-    try {
-      const { execSync } = require('child_process');
-      return execSync('tmux display-message -p "#S"', { encoding: 'utf8' }).trim();
-    } catch {}
-  }
-  // 2. Ghostty — derive from CWD (explicit for clarity, same result as fallback)
-  if (process.env.TERM_PROGRAM === 'ghostty') {
-    const raw = extractWorkspaceName(cwd);
-    return raw ? raw.replace(/[.:\s]/g, '-') : null;
-  }
-  // 3. Derive from CWD — apply the same sanitization /new uses for session names
-  // (dots, colons, spaces → hyphens) so the name matches the PTY handle key
-  const raw = extractWorkspaceName(cwd);
-  if (!raw) return null;
-  return raw.replace(/[.:\s]/g, '-');
-}
-
-function escapeMarkdown(text: string): string {
-  return text.replace(/([_*`\[])/g, '\\$1');
 }
 
 // ── Run ─────────────────────────────────────────────────────────
 
 main().catch((err: Error) => {
-  process.stderr.write(`[question-notify] Fatal: ${err.message}\n`);
+  logErr(TAG, `Fatal: ${err.message}`);
 });

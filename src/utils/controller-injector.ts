@@ -3,11 +3,14 @@
  * Injects commands into tmux sessions or PTY
  */
 
-import { execSync, spawn } from 'child_process';
+import { execFileSync } from 'child_process';
 import path from 'path';
 import fs from 'fs';
 import Logger from '../core/logger';
 import { PROJECT_ROOT } from './paths';
+import { hasSession, resolvePaneTarget, sendLiteral, sendKeys } from './tmux';
+import { readJsonSafe } from './atomic-json';
+import type { SessionEntry } from '../types/session';
 
 interface ControllerInjectorConfig {
     mode?: string;
@@ -44,28 +47,41 @@ class ControllerInjector {
         }
     }
 
-    _injectTmux(command: string, sessionName: string): boolean {
+    async _injectTmux(command: string, sessionName: string): Promise<boolean> {
         try {
-            // Check if tmux session exists
-            try {
-                execSync(`tmux has-session -t ${sessionName}`, { stdio: 'ignore' });
-            } catch (error) {
+            // Check if tmux session exists (exact name match, no prefix fallback)
+            if (!await hasSession(sessionName)) {
                 throw new Error(`Tmux session '${sessionName}' not found`);
             }
 
-            // Send command to tmux session and execute it
-            const escapedCommand = command.replace(/'/g, "'\\''");
-
-            // Send command first
-            execSync(`tmux send-keys -t ${sessionName} '${escapedCommand}'`);
+            const target = await resolvePaneTarget(sessionName, this._recordedPane(sessionName));
+            // Send the text literally (send-keys -l --: no shell, no key-name parsing)
+            await sendLiteral(target, command);
             // Then send Enter as separate command
-            execSync(`tmux send-keys -t ${sessionName} Enter`);
+            await sendKeys(target, 'Enter');
 
             this.logger.info(`Command injected to tmux session '${sessionName}'`);
             return true;
         } catch (error) {
             this.logger.error('Failed to inject command via tmux:', (error as Error).message);
             throw error;
+        }
+    }
+
+    /** Pane id ($TMUX_PANE) recorded by the hooks for the newest live entry of this tmux session. */
+    _recordedPane(sessionName: string): string | undefined {
+        const sessionMapPath = process.env.SESSION_MAP_PATH ||
+                               path.join(PROJECT_ROOT, 'src/data/session-map.json');
+        try {
+            const map = readJsonSafe<Record<string, Partial<SessionEntry>>>(sessionMapPath, {});
+            let best: Partial<SessionEntry> | undefined;
+            for (const entry of Object.values(map || {})) {
+                if (!entry || entry.tmuxSession !== sessionName || entry.endedAt || !entry.tmuxPane) continue;
+                if (!best || (entry.createdAt || 0) > (best.createdAt || 0)) best = entry;
+            }
+            return best?.tmuxPane;
+        } catch {
+            return undefined;
         }
     }
 
@@ -100,9 +116,10 @@ class ControllerInjector {
     listSessions(): string[] {
         if (this.mode === 'tmux') {
             try {
-                const output = execSync('tmux list-sessions -F "#{session_name}"', {
+                const output = execFileSync('tmux', ['list-sessions', '-F', '#{session_name}'], {
                     encoding: 'utf8',
-                    stdio: ['ignore', 'pipe', 'ignore']
+                    stdio: ['ignore', 'pipe', 'ignore'],
+                    timeout: 5000,
                 });
                 return output.trim().split('\n').filter(Boolean);
             } catch (error) {

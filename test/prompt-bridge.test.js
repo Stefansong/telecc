@@ -145,3 +145,38 @@ describe('cleanExpired', () => {
     expect(bridge.readPending(id)).not.toBeNull();
   });
 });
+
+describe('isPromptAlive', () => {
+  it('is true while the writing process lives and no response exists', () => {
+    bridge.writePending('a1', { workspace: 'w' });
+    expect(bridge.isPromptAlive('a1')).toBe(true);
+    bridge.writeResponse('a1', { action: 'allow' });
+    expect(bridge.isPromptAlive('a1')).toBe(false);
+  });
+
+  it('is false when the hook process has exited', () => {
+    bridge.writePending('a2', { workspace: 'w', pid: 2147483646 });
+    expect(bridge.isPromptAlive('a2')).toBe(false);
+  });
+
+  it('is false for unknown prompts', () => {
+    expect(bridge.isPromptAlive('nope')).toBe(false);
+  });
+});
+
+describe('findAwaitingTextPrompt', () => {
+  it('matches by reply message id', () => {
+    bridge.writePending('t1', { awaitingText: true, messageId: 100 });
+    bridge.writePending('t2', { awaitingText: true, messageId: 200 });
+    expect(bridge.findAwaitingTextPrompt(200)).toBe('t2');
+    expect(bridge.findAwaitingTextPrompt(999)).toBe(null);
+  });
+
+  it('without a reply id, only returns an unambiguous single prompt', () => {
+    bridge.writePending('t1', { awaitingText: true, messageId: 100 });
+    bridge.writePending('b1', { workspace: 'w' }); // button prompt, not text
+    expect(bridge.findAwaitingTextPrompt()).toBe('t1');
+    bridge.writePending('t2', { awaitingText: true, messageId: 200 });
+    expect(bridge.findAwaitingTextPrompt()).toBe(null);
+  });
+});

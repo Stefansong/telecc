@@ -9,8 +9,8 @@
  *   3. Outputs the permission decision via stdout
  *   4. Exits cleanly
  *
- * Stdin JSON: { tool_name, tool_input, cwd, session_id, hook_event_name }
- * Stdout JSON: { hookSpecificOutput: { hookEventName, decision: { behavior } } }
+ * Stdin JSON: { tool_name, tool_input, cwd, session_id, hook_event_name, permission_suggestions? }
+ * Stdout JSON: { hookSpecificOutput: { hookEventName, decision: { behavior, updatedPermissions?, message?, interrupt? } } }
  */
 
 import path from 'path';
@@ -18,18 +18,19 @@ import { PROJECT_ROOT } from './src/utils/paths';
 require('dotenv').config({ path: path.join(PROJECT_ROOT, '.env'), quiet: true });
 
 import fs from 'fs';
-import https from 'https';
-import { execSync } from 'child_process';
 import { extractWorkspaceName, trackNotificationMessage } from './workspace-router';
-import { generatePromptId, writePending, cleanPrompt, PROMPTS_DIR } from './prompt-bridge';
-import { isUserActiveAtTerminal } from './src/utils/active-check';
-import type { InlineKeyboardMarkup, TelegramMessage, PermissionHookOutput } from './src/types';
+import { generatePromptId } from './prompt-bridge';
+import { shouldDeferToTerminal, hookProjectDir } from './src/utils/active-check';
+import { capturePane, resolvePaneTarget } from './src/utils/tmux';
+import {
+  routeConsoleToStderr, readStdin, parsePayload, emitJson, logErr,
+  escapeHtml, truncateText, fitHtml, markdownToHtml, formatToolDescriptionHtml,
+  sendHtmlWithFallback, stopTypingSignal, hookDeadline, openPrompt, closePrompt,
+  installPromptCleanup, pollForResponse, detectSessionName, telegramConfigured,
+} from './src/utils/hook-utils';
+import type { InlineKeyboardMarkup, PermissionHookOutput, PermissionUpdateEntry } from './src/types';
 
-const BOT_TOKEN = process.env.TELEGRAM_BOT_TOKEN;
-const CHAT_ID = process.env.TELEGRAM_CHAT_ID;
-
-const POLL_INTERVAL_MS = 500;
-const POLL_TIMEOUT_MS = 90000; // 90 seconds max wait
+const TAG = 'permission-hook';
 
 // Debug logging to file (since stdout is for Claude Code)
 const LOG_FILE = path.join(PROJECT_ROOT, 'logs', 'permission-hook-debug.log');
@@ -43,108 +44,103 @@ function debugLog(msg: string): void {
 // ── Main ────────────────────────────────────────────────────────
 
 async function main(): Promise<void> {
+  routeConsoleToStderr();
+  installPromptCleanup(TAG);
+  const deadline = hookDeadline('permission-hook.js');
+
   const raw = await readStdin();
-  let payload: Record<string, unknown>;
-  try {
-    payload = JSON.parse(raw);
-  } catch {
-    return; // Can't parse — exit without decision
-  }
+  // Telegram off / not configured — no decision, Claude Code shows its own UI
+  if (!telegramConfigured()) return;
+  const payload = parsePayload(raw);
+  if (!payload) return; // Can't parse — exit without decision
 
   const toolName = (payload.tool_name as string) || 'Unknown';
 
   // AskUserQuestion: exit silently so Claude Code shows the interactive
   // question/permission UI in the terminal. The question-notify.js PreToolUse
-  // hook sends the Telegram notification. Clicking an option injects arrow
-  // keys + Enter which both selects the answer AND grants permission.
+  // hook sends the Telegram notification.
   if (toolName === 'AskUserQuestion') {
     return;
   }
 
-  // If user is actively at the terminal AND this wasn't injected from Telegram,
-  // exit without a decision so Claude Code shows its own permission UI locally.
-  // Uses the same 300s (5 min) threshold as notification hooks.
-  // If user stepped away more than 5 min ago, Telegram handles the permission
-  // so Claude isn't left stuck waiting with no way to respond.
-  const typingActivePath = path.join(PROJECT_ROOT, 'src/data', 'typing-active');
-  const isTelegramInjected = fs.existsSync(typingActivePath);
-  if (!isTelegramInjected && isUserActiveAtTerminal()) {
-    debugLog(`[skip] User is at terminal (within 5 min) — deferring to Claude Code's own permission UI`);
+  // Key everything on the project root (stable when Claude cd's into a subdirectory)
+  const dir = hookProjectDir(payload.cwd as string);
+
+  // User is working in THIS session at the terminal and the turn didn't come from
+  // Telegram → exit without a decision so Claude Code shows its own permission UI.
+  // Otherwise (remote-driven, or user away > threshold) Telegram handles it so Claude
+  // isn't left stuck waiting with no way to respond.
+  if (shouldDeferToTerminal(dir)) {
+    debugLog(`[skip] User is active in this session at the terminal — deferring to Claude Code's own permission UI`);
     return;
   }
 
   const toolInput = (payload.tool_input || {}) as Record<string, unknown>;
-  const cwd = (payload.cwd as string) || process.cwd();
-  const workspace = extractWorkspaceName(cwd)!;
+  const workspace = extractWorkspaceName(dir) || 'unknown';
   const sessionTitle = (payload.session_title as string) || null; // v2.1.94+
   const promptId = generatePromptId();
-  const tmuxSession = detectSessionName(cwd);
+  const tmuxSession = await detectSessionName(extractWorkspaceName(dir));
+  const suggestions = validSuggestions(payload.permission_suggestions);
 
   const isPlan = toolName === 'ExitPlanMode';
+  const titleSuffix = sessionTitle ? ` (${escapeHtml(truncateText(sessionTitle, 100))})` : '';
+  const header = (icon: string, label: string): string =>
+    `${icon} <b>${label}</b> — ${escapeHtml(truncateText(workspace, 100))}${titleSuffix}`;
 
   // Build Telegram message and keyboard
   let messageText: string;
   let keyboard: InlineKeyboardMarkup;
 
   if (isPlan) {
-    // Plan approval — try to capture plan content from tmux
-    let planContent = '';
-    if (tmuxSession) {
+    // Plan approval — Claude Code injects the plan into tool_input.plan; only fall back
+    // to capturing the pane when it's missing (older Claude Code).
+    let planContent = typeof toolInput.plan === 'string' ? toolInput.plan.trim() : '';
+    if (!planContent && tmuxSession && process.env.TMUX) {
       try {
-        const paneOutput = execSync(
-          `tmux capture-pane -t ${tmuxSession} -p -S -50 2>/dev/null`,
-          { encoding: 'utf8', timeout: 3000 }
-        );
-        planContent = cleanPlanOutput(paneOutput);
+        const target = await resolvePaneTarget(tmuxSession, process.env.TMUX_PANE);
+        planContent = cleanPlanOutput(await capturePane(target, 50));
       } catch {}
     }
 
-    messageText = `\u{1F4CB} *Plan Approval* — ${escapeMarkdown(workspace)}`;
-    if (planContent) {
-      const truncated = planContent.length > 2500
-        ? planContent.slice(0, 2497) + '...'
-        : planContent;
-      messageText += `\n\n${truncated}`;
-    }
+    messageText = fitHtml(budget => {
+      let html = header('\u{1F4CB}', 'Plan Approval');
+      if (planContent) html += `\n\n${markdownToHtml(truncateText(planContent, budget))}`;
+      return html;
+    }, 3500);
 
     keyboard = {
       inline_keyboard: [
         [
-          { text: '\u2705 Approve', callback_data: `perm:${promptId}:allow` },
-          { text: '\u274C Reject', callback_data: `perm:${promptId}:deny` },
+          { text: '✅ Approve', callback_data: `perm:${promptId}:allow` },
+          { text: '❌ Reject', callback_data: `perm:${promptId}:deny` },
         ],
       ],
     };
   } else {
     // Tool permission request
-    const toolDescription = formatToolDescription(toolName, toolInput);
-
-    // Include session title if available (v2.1.94+)
-    const titleSuffix = sessionTitle ? ` (${escapeMarkdown(sessionTitle)})` : '';
-    messageText = `\u{1F510} *Permission* — ${escapeMarkdown(workspace)}${titleSuffix}\n\n*Tool:* ${escapeMarkdown(toolName)}`;
-    if (toolDescription) {
-      const truncated = toolDescription.length > 2500
-        ? toolDescription.slice(0, 2497) + '...'
-        : toolDescription;
-      messageText += `\n${truncated}`;
-    }
+    messageText = fitHtml(budget => {
+      let html = `${header('\u{1F510}', 'Permission')}\n\n<b>Tool:</b> <code>${escapeHtml(truncateText(toolName, 100))}</code>`;
+      const description = formatToolDescriptionHtml(toolName, toolInput, budget);
+      if (description) html += `\n${description}`;
+      return html;
+    }, 3000);
 
     keyboard = {
       inline_keyboard: [
         [
-          { text: '\u2705 Allow', callback_data: `perm:${promptId}:allow` },
-          { text: '\u274C Deny', callback_data: `perm:${promptId}:deny` },
+          { text: '✅ Allow', callback_data: `perm:${promptId}:allow` },
+          { text: '❌ Deny', callback_data: `perm:${promptId}:deny` },
           { text: '\u{1F513} Always', callback_data: `perm:${promptId}:always` },
         ],
         [
-          { text: '\u23F8 Defer', callback_data: `perm:${promptId}:defer` },
+          { text: '⏸ Defer', callback_data: `perm:${promptId}:defer` },
         ],
       ],
     };
   }
 
   // Write pending file so bot callback handler can write the response
-  writePending(promptId, {
+  openPrompt(promptId, {
     type: isPlan ? 'plan' : 'permission',
     workspace,
     toolName,
@@ -152,227 +148,93 @@ async function main(): Promise<void> {
     tmuxSession,
   });
 
-  // Send Telegram message with inline keyboard
-  debugLog(`[${promptId}] Sending Telegram message for ${toolName}...`);
   try {
-    const result = await sendTelegramWithKeyboard(messageText, keyboard);
-    debugLog(`[${promptId}] Telegram message sent`);
-    if (result && result.message_id) {
-      trackNotificationMessage(result.message_id, workspace, 'permission');
+    // Send Telegram message with inline keyboard (HTML, plain-text retry on failure)
+    debugLog(`[${promptId}] Sending Telegram message for ${toolName}...`);
+    try {
+      const result = await sendHtmlWithFallback(messageText, { tag: TAG, replyMarkup: keyboard, deadlineMs: deadline });
+      debugLog(`[${promptId}] Telegram message sent`);
+      stopTypingSignal();
+      if (result && result.message_id) {
+        trackNotificationMessage(result.message_id, workspace, 'permission');
+      }
+    } catch (err: unknown) {
+      debugLog(`[${promptId}] Telegram send failed: ${(err as Error).message}`);
+      logErr(TAG, `Telegram send failed: ${(err as Error).message}`);
+      return; // Can't notify — exit without decision (Claude Code shows its own UI)
     }
-  } catch (err: unknown) {
-    debugLog(`[${promptId}] Telegram send failed: ${(err as Error).message}`);
-    process.stderr.write(`[permission-hook] Telegram send failed: ${(err as Error).message}\n`);
-    cleanPrompt(promptId);
-    return; // Can't notify — exit without decision
-  }
 
-  // Poll for response file
-  debugLog(`[${promptId}] Starting to poll for response...`);
-  const response = await pollForResponse(promptId);
+    // Poll for response until the hook's overall deadline
+    debugLog(`[${promptId}] Starting to poll for response...`);
+    const response = await pollForResponse(promptId, deadline);
 
-  if (response) {
+    if (!response) {
+      debugLog(`[${promptId}] No response received before the hook deadline`);
+      logErr(TAG, 'Timed out waiting for response');
+      return;
+    }
+
     const action = (response.action as string) || 'allow';
     debugLog(`[${promptId}] Got response: action=${action}`);
+    const output = buildDecision(action, isPlan, suggestions);
+    const outputStr = JSON.stringify(output);
+    debugLog(`[${promptId}] Writing to stdout: ${outputStr}`);
+    emitJson(output);
+  } finally {
+    closePrompt(promptId);
+    debugLog(`[${promptId}] Cleaned up`);
+  }
+}
 
-    // Handle defer action — pause the session so user can resume later
-    if (action === 'defer') {
-      // For PermissionRequest, defer means deny but with a message suggesting resume
-      const output: PermissionHookOutput = {
-        hookSpecificOutput: {
-          hookEventName: 'PermissionRequest',
-          decision: {
-            behavior: 'deny',
-          },
-        },
-        systemMessage: 'Session paused via Telegram. Resume with: claude --resume',
-      };
-      const outputStr = JSON.stringify(output);
-      debugLog(`[${promptId}] Writing defer (as deny) to stdout: ${outputStr}`);
-      process.stdout.write(outputStr + '\n');
-      debugLog(`[${promptId}] Stdout written`);
-    } else {
-      let decision: 'allow' | 'deny';
-      if (action === 'deny') {
-        decision = 'deny';
-      } else {
-        decision = 'allow';
-      }
+// ── Decision ────────────────────────────────────────────────────
 
-      const output: PermissionHookOutput = {
-        hookSpecificOutput: {
-          hookEventName: 'PermissionRequest',
-          decision: {
-            behavior: decision,
-          },
-        },
-        systemMessage: `Decision received via Telegram: user ${decision}ed`,
-      };
+/** Keep only well-formed permission update entries from the hook input. */
+function validSuggestions(raw: unknown): PermissionUpdateEntry[] {
+  if (!Array.isArray(raw)) return [];
+  return raw.filter((e): e is PermissionUpdateEntry =>
+    !!e && typeof e === 'object' && typeof (e as Record<string, unknown>).type === 'string'
+      && typeof (e as Record<string, unknown>).destination === 'string');
+}
 
-      const outputStr = JSON.stringify(output);
-      debugLog(`[${promptId}] Writing to stdout: ${outputStr}`);
-      process.stdout.write(outputStr + '\n');
-      debugLog(`[${promptId}] Stdout written`);
-    }
-  } else {
-    debugLog(`[${promptId}] No response received (timed out or error)`);
+function buildDecision(action: string, isPlan: boolean, suggestions: PermissionUpdateEntry[]): PermissionHookOutput {
+  const out = (decision: PermissionHookOutput['hookSpecificOutput']['decision'], systemMessage: string): PermissionHookOutput => ({
+    hookSpecificOutput: { hookEventName: 'PermissionRequest', decision },
+    systemMessage,
+  });
+
+  if (action === 'defer') {
+    // Stop Claude (interrupt) rather than letting it carry on after a plain deny.
+    return out({
+      behavior: 'deny',
+      message: 'The user paused this session remotely from Telegram (Defer). Do not retry or work around this; stop and wait for the user\'s next instruction.',
+      interrupt: true,
+    }, 'Paused via Telegram (Defer) — Claude was stopped. Send a new message to continue.');
   }
 
-  // Clean up
-  cleanPrompt(promptId);
-  debugLog(`[${promptId}] Cleaned up, letting process exit naturally`);
-}
+  if (action === 'deny') {
+    return out({
+      behavior: 'deny',
+      message: isPlan
+        ? 'The user rejected this plan via Telegram.'
+        : 'The user denied this tool call via Telegram.',
+    }, isPlan ? 'Plan rejected via Telegram' : 'Decision received via Telegram: user denied');
+  }
 
-// ── Polling ─────────────────────────────────────────────────────
+  if (action === 'always' && !isPlan) {
+    if (suggestions.length > 0) {
+      // Echo Claude Code's own suggested permission updates so the rule is persisted
+      // exactly like the terminal's "Yes, and don't ask again" option.
+      return out({ behavior: 'allow', updatedPermissions: suggestions },
+        'Decision received via Telegram: always allow (permission rule saved)');
+    }
+    return out({ behavior: 'allow' },
+      'Decision received via Telegram: allowed once (Claude Code offered no permission rule to save for this call)');
+  }
 
-function pollForResponse(promptId: string): Promise<Record<string, unknown> | null> {
-  return new Promise((resolve) => {
-    const responseFile = path.join(PROMPTS_DIR, `response-${promptId}.json`);
-    const startTime = Date.now();
-
-    const interval = setInterval(() => {
-      // Check timeout
-      if (Date.now() - startTime > POLL_TIMEOUT_MS) {
-        clearInterval(interval);
-        process.stderr.write(`[permission-hook] Timed out waiting for response\n`);
-        resolve(null);
-        return;
-      }
-
-      // Check for response file
-      try {
-        if (fs.existsSync(responseFile)) {
-          const raw = fs.readFileSync(responseFile, 'utf8');
-          const data = JSON.parse(raw);
-          clearInterval(interval);
-          resolve(data);
-        }
-      } catch {
-        // File not ready yet or parse error — keep polling
-      }
-    }, POLL_INTERVAL_MS);
-  });
-}
-
-// ── Telegram ────────────────────────────────────────────────────
-
-function sendTelegramWithKeyboard(text: string, replyMarkup: InlineKeyboardMarkup): Promise<TelegramMessage | null> {
-  return new Promise((resolve, reject) => {
-    const body = JSON.stringify({
-      chat_id: CHAT_ID,
-      text,
-      parse_mode: 'Markdown',
-      reply_markup: replyMarkup,
-    });
-
-    const options: https.RequestOptions = {
-      hostname: 'api.telegram.org',
-      path: `/bot${BOT_TOKEN}/sendMessage`,
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        'Content-Length': Buffer.byteLength(body),
-      },
-      timeout: 5000,
-    };
-
-    const req = https.request(options, (res) => {
-      let data = '';
-      res.on('data', (chunk: string) => { data += chunk; });
-      res.on('end', () => {
-        if (res.statusCode! >= 200 && res.statusCode! < 300) {
-          try {
-            const parsed = JSON.parse(data);
-            resolve(parsed.result || null);
-          } catch {
-            resolve(null);
-          }
-        } else {
-          reject(new Error(`Telegram API ${res.statusCode}: ${data}`));
-        }
-      });
-    });
-
-    req.on('error', reject);
-    req.on('timeout', () => {
-      req.destroy();
-      reject(new Error('Telegram request timed out'));
-    });
-
-    req.write(body);
-    req.end();
-  });
+  return out({ behavior: 'allow' }, isPlan ? 'Plan approved via Telegram' : 'Decision received via Telegram: user allowed');
 }
 
 // ── Helpers ──────────────────────────────────────────────────────
-
-function readStdin(): Promise<string> {
-  return new Promise((resolve) => {
-    let data = '';
-    let resolved = false;
-    process.stdin.setEncoding('utf8');
-    process.stdin.on('data', (chunk: string) => { data += chunk; });
-    process.stdin.on('end', () => {
-      if (!resolved) { resolved = true; resolve(data); }
-    });
-    setTimeout(() => {
-      if (!resolved) {
-        resolved = true;
-        process.stdin.destroy();
-        resolve(data || '{}');
-      }
-    }, 500);
-  });
-}
-
-function detectSessionName(cwd: string): string | null {
-  // 1. Try tmux (existing behaviour)
-  if (process.env.TMUX) {
-    try {
-      return execSync('tmux display-message -p "#S"', { encoding: 'utf8' }).trim();
-    } catch {}
-  }
-  // 2. Derive from CWD — apply the same sanitization /new uses for session names
-  // (dots, colons, spaces → hyphens) so the name matches the PTY handle key
-  const raw = extractWorkspaceName(cwd);
-  if (!raw) return null;
-  return raw.replace(/[.:\s]/g, '-');
-}
-
-function formatToolDescription(toolName: string, toolInput: Record<string, unknown>): string {
-  if (toolName === 'Bash' && toolInput.command) {
-    const cmd = toolInput.command as string;
-    const truncated = cmd.length > 500 ? cmd.slice(0, 497) + '...' : cmd;
-    return `*Command:* \`${escapeMarkdown(truncated)}\``;
-  }
-  if (toolName === 'Edit' && toolInput.file_path) {
-    const filePath = escapeMarkdown(toolInput.file_path as string);
-    if (toolInput.old_string && toolInput.new_string) {
-      const maxLines = 12;
-      const oldLines = (toolInput.old_string as string).split('\n');
-      const newLines = (toolInput.new_string as string).split('\n');
-      const oldTrunc = oldLines.length > maxLines;
-      const newTrunc = newLines.length > maxLines;
-      const oldStr = oldLines.slice(0, maxLines).map(l => `- ${l}`).join('\n') + (oldTrunc ? '\n  ...' : '');
-      const newStr = newLines.slice(0, maxLines).map(l => `+ ${l}`).join('\n') + (newTrunc ? '\n  ...' : '');
-      return `*File:* \`${filePath}\`\n\`\`\`\n${oldStr}\n${newStr}\n\`\`\``;
-    }
-    return `*File:* \`${filePath}\``;
-  }
-  if (toolName === 'Write' && toolInput.file_path) {
-    return `*File:* \`${escapeMarkdown(toolInput.file_path as string)}\``;
-  }
-  if (toolName === 'Read' && toolInput.file_path) {
-    return `*File:* \`${escapeMarkdown(toolInput.file_path as string)}\``;
-  }
-  const keys = Object.keys(toolInput);
-  if (keys.length > 0) {
-    const key = keys[0];
-    const val = String(toolInput[key]).slice(0, 200);
-    return `*${escapeMarkdown(key)}:* \`${escapeMarkdown(val)}\``;
-  }
-  return '';
-}
 
 function cleanPlanOutput(raw: string): string {
   let lines = raw.split('\n');
@@ -385,7 +247,7 @@ function cleanPlanOutput(raw: string): string {
   lines = lines.filter(l => {
     const t = l.trim();
     if (!t) return true;
-    if (/^[\u280B\u2819\u2839\u2838\u283C\u2834\u2826\u2827\u2807\u280F]/.test(t)) return false;
+    if (/^[⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏]/.test(t)) return false;
     if (/^(Clauding|Working|Waiting|Processing)/i.test(t)) return false;
     if (/^.+\|.+\|.+\|.+\$/.test(t)) return false;
     return true;
@@ -393,12 +255,8 @@ function cleanPlanOutput(raw: string): string {
   return lines.join('\n').trim();
 }
 
-function escapeMarkdown(text: string): string {
-  return text.replace(/([_*`\[])/g, '\\$1');
-}
-
 // ── Run ─────────────────────────────────────────────────────────
 
 main().catch((err: Error) => {
-  process.stderr.write(`[permission-hook] Fatal: ${err.message}\n`);
+  logErr(TAG, `Fatal: ${err.message}`);
 });

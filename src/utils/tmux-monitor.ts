@@ -4,11 +4,30 @@
  * Based on the original email automation mechanism but adapted for real-time notifications
  */
 
-import { execSync } from 'child_process';
+import { execFileSync } from 'child_process';
 import EventEmitter from 'events';
 import fs from 'fs';
 import path from 'path';
 import TraceCapture from './trace-capture';
+import { paneTarget } from './tmux';
+
+/**
+ * Run tmux synchronously with an argv array (no shell): session names and paths
+ * are never interpreted. These monitor APIs are synchronous, so the async helpers
+ * in ./tmux can't be used directly; targets still come from its paneTarget().
+ */
+function tmuxSync(args: string[]): string {
+    return execFileSync('tmux', args, {
+        encoding: 'utf8',
+        stdio: ['ignore', 'pipe', 'ignore'],
+        timeout: 5000,
+    });
+}
+
+/** Single-quote a string for /bin/sh (used for pipe-pane's shell-command argument). */
+function shellQuote(str: string): string {
+    return `'${str.replace(/'/g, `'\\''`)}'`;
+}
 
 interface MonitorEvent {
     type: 'completed' | 'waiting';
@@ -157,10 +176,7 @@ class TmuxMonitor extends EventEmitter {
 
     _sessionExists(): boolean {
         try {
-            const sessions = execSync('tmux list-sessions -F "#{session_name}"', {
-                encoding: 'utf8',
-                stdio: ['ignore', 'pipe', 'ignore']
-            }).trim().split('\n');
+            const sessions = tmuxSync(['list-sessions', '-F', '#{session_name}']).trim().split('\n');
 
             return sessions.includes(this.sessionName);
         } catch (error: unknown) {
@@ -183,10 +199,7 @@ class TmuxMonitor extends EventEmitter {
     _captureCurrentContent(): string {
         try {
             // Capture current pane content
-            const content = execSync(`tmux capture-pane -t ${this.sessionName} -p`, {
-                encoding: 'utf8',
-                stdio: ['ignore', 'pipe', 'ignore']
-            });
+            const content = tmuxSync(['capture-pane', '-p', '-t', paneTarget(this.sessionName)]);
 
             return content;
         } catch (error: unknown) {
@@ -408,18 +421,23 @@ class TmuxMonitor extends EventEmitter {
     }
 
     // Original capture methods (legacy support)
+    /** Capture log path for a session; the name is sanitised so it can't escape captureDir. */
+    _captureFile(sessionName: string): string {
+        const safeName = sessionName.replace(/[^A-Za-z0-9._-]/g, '_').replace(/^\.+/, '_');
+        return path.join(this.captureDir, `${safeName}.log`);
+    }
+
     /**
      * Start capturing a tmux session
      */
     startCapture(sessionName: string): string | null {
         try {
-            const captureFile = path.join(this.captureDir, `${sessionName}.log`);
+            const captureFile = this._captureFile(sessionName);
+            fs.mkdirSync(path.dirname(captureFile), { recursive: true });
 
-            // Start pipe-pane to capture all session output
-            execSync(`tmux pipe-pane -t ${sessionName} -o "cat >> ${captureFile}"`, {
-                encoding: 'utf8',
-                stdio: 'ignore'
-            });
+            // Start pipe-pane to capture all session output. tmux runs the command via
+            // /bin/sh, so the path is single-quoted (and the file name is sanitised).
+            tmuxSync(['pipe-pane', '-o', '-t', paneTarget(sessionName), `cat >> ${shellQuote(captureFile)}`]);
 
             return captureFile;
         } catch (error: unknown) {
@@ -433,10 +451,7 @@ class TmuxMonitor extends EventEmitter {
      */
     stopCapture(sessionName: string): void {
         try {
-            execSync(`tmux pipe-pane -t ${sessionName}`, {
-                encoding: 'utf8',
-                stdio: 'ignore'
-            });
+            tmuxSync(['pipe-pane', '-t', paneTarget(sessionName)]);
         } catch (error: unknown) {
             console.error(`Failed to stop capture for session ${sessionName}:`, (error as Error).message);
         }
@@ -447,7 +462,7 @@ class TmuxMonitor extends EventEmitter {
      */
     getRecentConversation(sessionName: string, lines: number = 200): ConversationResult {
         try {
-            const captureFile = path.join(this.captureDir, `${sessionName}.log`);
+            const captureFile = this._captureFile(sessionName);
 
             if (!fs.existsSync(captureFile)) {
                 // If no capture file, try to get from tmux buffer
@@ -472,10 +487,7 @@ class TmuxMonitor extends EventEmitter {
     getFromTmuxBuffer(sessionName: string, lines: number = 200): ConversationResult {
         try {
             // Capture the pane contents
-            const buffer = execSync(`tmux capture-pane -t ${sessionName} -p -S -${lines}`, {
-                encoding: 'utf8',
-                stdio: ['ignore', 'pipe', 'ignore']
-            });
+            const buffer = tmuxSync(['capture-pane', '-p', '-t', paneTarget(sessionName), '-S', `-${Math.max(0, Math.floor(lines))}`]);
 
             return this.extractConversation(buffer, sessionName);
         } catch (error: unknown) {
@@ -490,12 +502,13 @@ class TmuxMonitor extends EventEmitter {
     getFullExecutionTrace(sessionName: string, lines: number = 1000): string {
         try {
             let content: string;
-            if (!fs.existsSync(path.join(this.captureDir, `${sessionName}.log`))) {
+            const captureFile = this._captureFile(sessionName);
+            if (!fs.existsSync(captureFile)) {
                 // If no capture file, try to get from tmux buffer
                 content = this.getFullTraceFromTmuxBuffer(sessionName, lines);
             } else {
                 // Read the capture file
-                content = fs.readFileSync(path.join(this.captureDir, `${sessionName}.log`), 'utf8');
+                content = fs.readFileSync(captureFile, 'utf8');
             }
 
             // Always filter content to only show from last user input
@@ -614,12 +627,7 @@ class TmuxMonitor extends EventEmitter {
     getFullTraceFromTmuxBuffer(sessionName: string, lines: number = 1000): string {
         try {
             // Capture the pane contents
-            const buffer = execSync(`tmux capture-pane -t ${sessionName} -p -S -${lines}`, {
-                encoding: 'utf8',
-                stdio: ['ignore', 'pipe', 'ignore']
-            });
-
-            return buffer;
+            return tmuxSync(['capture-pane', '-p', '-t', paneTarget(sessionName), '-S', `-${Math.max(0, Math.floor(lines))}`]);
         } catch (error: unknown) {
             console.error(`Failed to get tmux buffer for session ${sessionName}:`, (error as Error).message);
             return '';

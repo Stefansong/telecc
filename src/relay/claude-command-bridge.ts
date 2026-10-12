@@ -19,6 +19,11 @@ interface CommandData {
     response?: string;
 }
 
+/** AppleScript string literal with `\` and `"` escaped — the command text is attacker-controlled. */
+function appleScriptString(str: string): string {
+    return `"${str.replace(/\\/g, '\\\\').replace(/"/g, '\\"')}"`;
+}
+
 interface BridgeStatus {
     pendingCommands: number;
     processedCommands: number;
@@ -94,13 +99,11 @@ class ClaudeCommandBridge {
 
             if (process.platform === 'darwin') {
                 // macOS notification
-                const script = `
-                    display notification "${body.replace(/"/g, '\\"')}" with title "${title}" sound name "default"
-                `;
-                spawn('osascript', ['-e', script]);
+                const script = `display notification ${appleScriptString(body)} with title ${appleScriptString(title)} sound name "default"`;
+                spawn('osascript', ['-e', script]).on('error', () => {});
             } else if (process.platform === 'linux') {
                 // Linux notification
-                spawn('notify-send', [title, body]);
+                spawn('notify-send', ['--', title, body]).on('error', () => {});
             }
 
             this.logger.debug('System notification sent');

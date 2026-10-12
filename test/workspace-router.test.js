@@ -419,3 +419,163 @@ describe('rate limit tracking', () => {
     expect(result.remaining).toBe(50);
   });
 });
+
+describe('resolveWorkspace allowPrefix option', () => {
+  it('defaults to allowing prefix matches', () => {
+    seedSessions([['T1', 'api-server']]);
+    expect(router.resolveWorkspace('api').type).toBe('prefix');
+    expect(router.resolveWorkspace('api', {}).type).toBe('prefix');
+  });
+
+  it('allowPrefix: false only returns exact (case-insensitive) matches', () => {
+    seedSessions([['T1', 'api-server'], ['T2', 'API']]);
+    const exact = router.resolveWorkspace('api', { allowPrefix: false });
+    expect(exact.type).toBe('exact');
+    expect(exact.match.token).toBe('T2');
+
+    seedSessions([['T1', 'api-server']]);
+    expect(router.resolveWorkspace('api', { allowPrefix: false }).type).toBe('none');
+    expect(router.resolveWorkspace('API-SERVER', { allowPrefix: false }).type).toBe('exact');
+  });
+
+  it('allowPrefix: false never reports ambiguity', () => {
+    seedSessions([['T1', 'app-frontend'], ['T2', 'app-backend']]);
+    expect(router.resolveWorkspace('app', { allowPrefix: false }).type).toBe('none');
+  });
+});
+
+describe('ended sessions (markSessionEnded / endedAt)', () => {
+  it('markSessionEnded ends only the exiting session (by pane, then session id)', () => {
+    seedSessions([['T1', 'proj'], ['T2', 'other']]);
+    const map = router.readSessionMap();
+    map['T1'] = { ...map['T1'], tmuxPane: '%1', sessionId: 'sid-1' };
+    map['T3'] = { ...map['T1'], tmuxSession: 'claude-proj-2', tmuxPane: '%3', sessionId: 'sid-3' };
+    router.writeSessionMap(map);
+
+    const before = Math.floor(Date.now() / 1000);
+    router.markSessionEnded('/home/user/projects/proj/', { tmuxPane: '%3' }); // trailing slash normalised
+    let after = router.readSessionMap();
+    expect(after['T3'].endedAt).toBeGreaterThanOrEqual(before);
+    expect(after['T1'].endedAt).toBeUndefined();
+
+    router.markSessionEnded('/home/user/projects/proj', { sessionId: 'sid-1' });
+    after = router.readSessionMap();
+    expect(after['T1'].endedAt).toBeGreaterThanOrEqual(before);
+    expect(after['T2'].endedAt).toBeUndefined();
+  });
+
+  it('markSessionEnded without ids only ends an unambiguous cwd match', () => {
+    seedSessions([['T1', 'proj'], ['T2', 'other']]);
+    const map = router.readSessionMap();
+    map['T3'] = { ...map['T1'], tmuxSession: 'claude-proj-2' };
+    router.writeSessionMap(map);
+    router.markSessionEnded('/home/user/projects/proj');
+    expect(router.readSessionMap()['T1'].endedAt).toBeUndefined();
+    router.markSessionEnded('/home/user/projects/other');
+    expect(router.readSessionMap()['T2'].endedAt).toBeDefined();
+  });
+
+  it('ended sessions are skipped by every routing lookup', () => {
+    seedSessions([['T1', 'proj'], ['T2', 'other']]);
+    router.markSessionEnded('/home/user/projects/proj');
+
+    expect(router.resolveWorkspace('proj').type).toBe('none');
+    expect(router.resolveWorkspace('pro').type).toBe('none');
+    expect(router.findSessionByWorkspace('proj')).toBeNull();
+    expect(router.findSessionByTmuxName('claude-proj')).toBeUndefined();
+    expect(router.listActiveSessions().map(s => s.workspace)).toEqual(['other']);
+    expect(router.isEnded(router.readSessionMap()['T1'])).toBe(true);
+  });
+
+  it('an ended newer entry does not shadow an older live one', () => {
+    const now = Math.floor(Date.now() / 1000);
+    seedSessions([['OLD', 'proj', { createdAt: now - 100 }]]);
+    const map = router.readSessionMap();
+    map['NEW'] = { ...map['OLD'], createdAt: now, tmuxSession: 'claude-proj-new', endedAt: now };
+    router.writeSessionMap(map);
+    expect(router.findSessionByWorkspace('proj').token).toBe('OLD');
+    expect(router.resolveWorkspace('proj').match.token).toBe('OLD');
+  });
+
+  it('upsertSession revives an ended session (clears endedAt, keeps token)', () => {
+    const first = router.upsertSession({ cwd: '/home/user/projects/proj', tmuxSession: 'claude-proj', status: 'running', sessionType: 'pty' });
+    router.markSessionEnded('/home/user/projects/proj');
+    expect(router.readSessionMap()[first.token].endedAt).toBeDefined();
+
+    const second = router.upsertSession({ cwd: '/home/user/projects/proj', tmuxSession: 'claude-proj', status: 'running' });
+    expect(second.token).toBe(first.token);
+    expect(router.readSessionMap()[first.token].endedAt).toBeUndefined();
+    expect(router.findSessionByWorkspace('proj').token).toBe(first.token);
+  });
+
+  it('markSessionEnded on an unknown cwd leaves the map untouched', () => {
+    seedSessions([['T1', 'proj']]);
+    const before = fs.readFileSync(process.env.SESSION_MAP_PATH, 'utf8');
+    router.markSessionEnded('/nowhere');
+    expect(fs.readFileSync(process.env.SESSION_MAP_PATH, 'utf8')).toBe(before);
+  });
+});
+
+describe('upsertSession tmuxPane', () => {
+  const base = { cwd: '/home/user/projects/proj', tmuxSession: 'claude-proj', status: 'running' };
+
+  it('stores the pane id', () => {
+    const { token } = router.upsertSession({ ...base, tmuxPane: '%12' });
+    expect(router.readSessionMap()[token].tmuxPane).toBe('%12');
+  });
+
+  it('preserves the existing pane when not given and replaces it when given', () => {
+    const { token } = router.upsertSession({ ...base, tmuxPane: '%12' });
+    router.upsertSession({ ...base, status: 'waiting' });
+    expect(router.readSessionMap()[token].tmuxPane).toBe('%12');
+    router.upsertSession({ ...base, tmuxPane: '%40' });
+    expect(router.readSessionMap()[token].tmuxPane).toBe('%40');
+  });
+
+  it('omits tmuxPane entirely when never known', () => {
+    const { token } = router.upsertSession(base);
+    expect('tmuxPane' in router.readSessionMap()[token]).toBe(false);
+  });
+});
+
+describe('findSessionByTmuxName exact matching', () => {
+  it('does not prefix-match tmux session names', () => {
+    seedSessions([['T1', 'api-server']]); // tmuxSession: claude-api-server
+    expect(router.findSessionByTmuxName('claude-api')).toBeUndefined();
+    expect(router.findSessionByTmuxName('claude-api-server')).toBeDefined();
+    expect(router.findSessionByTmuxName('')).toBeUndefined();
+  });
+});
+
+describe('state file safety', () => {
+  it('writes atomically (no temp files left behind)', () => {
+    router.upsertSession({ cwd: '/home/user/projects/proj', tmuxSession: 'claude-proj', status: 'running' });
+    router.trackNotificationMessage(1, 'proj', 'completed');
+    router.setDefaultWorkspace('proj');
+    const leftovers = fs.readdirSync(testDir).filter(f => f.endsWith('.tmp'));
+    expect(leftovers).toEqual([]);
+  });
+
+  it('never silently replaces a corrupt session map with an empty one', () => {
+    const corrupt = '{"T1": {"cwd": "/home/user/projects/keep", ';
+    fs.writeFileSync(process.env.SESSION_MAP_PATH, corrupt);
+    router.upsertSession({ cwd: '/home/user/projects/new', tmuxSession: 'claude-new', status: 'running' });
+    // The unparseable original is preserved next to the map for recovery
+    const aside = fs.readdirSync(testDir).filter(f => f.startsWith('session-map.json.corrupt-'));
+    expect(aside).toHaveLength(1);
+    expect(fs.readFileSync(path.join(testDir, aside[0]), 'utf8')).toBe(corrupt);
+  });
+
+  it('does not overwrite project history when it cannot be read', () => {
+    const historyPath = path.join(testDir, 'project-history.json');
+    fs.mkdirSync(historyPath); // reading a directory fails with EISDIR (not ENOENT)
+    expect(() => router.recordProjectUsage('proj', testDir, 'uuid')).not.toThrow();
+    expect(fs.statSync(historyPath).isDirectory()).toBe(true);
+  });
+
+  it('tolerates non-object JSON in the session map', () => {
+    fs.writeFileSync(process.env.SESSION_MAP_PATH, 'null');
+    expect(router.readSessionMap()).toEqual({});
+    expect(router.listActiveSessions()).toEqual([]);
+  });
+});

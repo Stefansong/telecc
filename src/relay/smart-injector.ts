@@ -2,12 +2,17 @@
 
 /**
  * Smart Command Injector - Multiple methods to ensure commands reach Claude Code
+ *
+ * Only method 1 actually injects (paste into the frontmost app, and only when that
+ * app is a terminal). The other methods hand the command to the user (clipboard +
+ * notification / file) and therefore report `success: false` so the caller doesn't
+ * mark the email as processed. All osascript calls use execFile argv with escaped
+ * AppleScript strings — command text never passes through a shell.
  */
 
-import { exec, spawn } from 'child_process';
+import { execFile, spawn } from 'child_process';
 import fs from 'fs';
 import path from 'path';
-import os from 'os';
 
 interface LoggerLike {
     info: (...args: unknown[]) => void;
@@ -18,8 +23,39 @@ interface LoggerLike {
 
 interface InjectionResult {
     success: boolean;
+    /** The command was handed to the user (clipboard/file + notification) instead of injected. */
+    manual?: boolean;
     error?: string;
     message?: string;
+}
+
+/**
+ * Apps it's acceptable to paste into — mirrors ClipboardAutomation's allowlist.
+ * Anything else (browser, Obsidian, chat apps...) would receive the email text.
+ */
+const ALLOWED_FRONTMOST_APPS = [
+    'Terminal',
+    'iTerm2',
+    'iTerm',
+    'Claude',
+    'Claude Code',
+    'Visual Studio Code',
+    'Code',
+    'Cursor',
+    'Warp',
+    'WezTerm',
+    'Alacritty',
+    'Ghostty',
+    'kitty',
+    'Hyper',
+];
+
+/** pbcopy/pbpaste pick their text encoding from LANG; without it CJK text is garbled. */
+const CLIPBOARD_ENV = { ...process.env, LANG: 'en_US.UTF-8' };
+
+/** AppleScript string literal with `\` and `"` escaped (for osascript argv, never a shell). */
+function appleScriptString(str: string): string {
+    return `"${str.replace(/\\/g, '\\\\').replace(/"/g, '\\"')}"`;
 }
 
 class SmartInjector {
@@ -38,6 +74,7 @@ class SmartInjector {
         }
     }
 
+    /** Returns true only when the command was actually injected (not merely handed off). */
     async injectCommand(token: string, command: string): Promise<boolean> {
         this.log.info(`Smart command injection: ${command.slice(0, 50)}...`);
 
@@ -58,6 +95,10 @@ class SmartInjector {
                 if (result.success) {
                     this.log.info(`${methodName} successful: ${result.message}`);
                     return true;
+                } else if (result.manual) {
+                    // The user has been told how to paste it; stop here, but it was NOT injected
+                    this.log.warn(`${methodName}: ${result.message} — command handed off for manual paste, not injected`);
+                    return false;
                 } else {
                     this.log.warn(`${methodName} failed: ${result.error}`);
                 }
@@ -70,156 +111,144 @@ class SmartInjector {
         return false;
     }
 
-    // Method 1: AppleScript Auto-injection
+    // Method 1: AppleScript Auto-injection — paste only into a frontmost terminal app
     async tryAppleScriptInjection(token: string, command: string): Promise<InjectionResult> {
-        return new Promise((resolve) => {
-            // First copy to clipboard
-            this.copyToClipboard(command).then(() => {
-                const script = `
+        if (process.platform !== 'darwin') {
+            return { success: false, error: 'not_supported_on_platform' };
+        }
+
+        await this.copyToClipboard(command);
+
+        // Check the frontmost app and paste in the same script, so focus can't move in between
+        const allowList = `{${ALLOWED_FRONTMOST_APPS.map(appleScriptString).join(', ')}}`;
+        const script = `
                 tell application "System Events"
-                    set targetApps to {"Claude", "Claude Code", "Terminal", "iTerm2", "iTerm"}
-                    set targetApp to null
-
-                    repeat with appName in targetApps
-                        try
-                            if application process appName exists then
-                                set targetApp to application process appName
-                                exit repeat
-                            end if
-                        end try
-                    end repeat
-
-                    if targetApp is not null then
-                        set frontmost of targetApp to true
-                        delay 0.5
-                        keystroke "v" using command down
-                        delay 0.3
-                        keystroke return
-                        return "success"
-                    else
-                        return "no_target"
-                    end if
+                    set activeApp to name of first application process whose frontmost is true
+                    if activeApp is not in ${allowList} then return "not_terminal:" & activeApp
+                    keystroke "v" using command down
+                    delay 0.3
+                    keystroke return
+                    return "success"
                 end tell
                 `;
 
-                exec(`osascript -e '${script}'`, (error: Error | null, stdout: string) => {
-                    if (error) {
-                        if (error.message.includes('1002') || error.message.includes('not allowed')) {
-                            resolve({ success: false, error: 'permission_denied' });
-                        } else {
-                            resolve({ success: false, error: error.message });
-                        }
-                    } else {
-                        const result = stdout.trim();
-                        if (result === 'success') {
-                            resolve({ success: true, message: 'Auto-paste successful' });
-                        } else {
-                            resolve({ success: false, error: result });
-                        }
-                    }
-                });
-            });
-        });
-    }
-
-    // Method 2: File Drag Injection
-    async tryFileDropInjection(token: string, command: string): Promise<InjectionResult> {
-        return new Promise((resolve) => {
-            try {
-                // Create temporary command file
-                const fileName = `taskping-command-${token}.txt`;
-                const filePath = path.join(this.tempDir, fileName);
-
-                fs.writeFileSync(filePath, command);
-
-                // Copy file path to clipboard
-                this.copyToClipboard(filePath).then(() => {
-                    // Send notification to guide user
-                    const notificationScript = `
-                        display notification "Command file created and path copied to clipboard!\\n1. Press Cmd+G in Finder and paste path\\n2. Drag file to Claude Code window" with title "TaskPing File Injection" subtitle "Drag file: ${fileName}" sound name "Glass"
-                    `;
-
-                    exec(`osascript -e '${notificationScript}'`, () => {
-                        // Try to automatically open Finder to target directory
-                        exec(`open "${this.tempDir}"`, () => {
-                            resolve({ success: true, message: 'File created, notification sent' });
-                        });
-                    });
-                });
-
-            } catch (error: unknown) {
-                resolve({ success: false, error: (error as Error).message });
+        const { error, stdout } = await this.runOsascript(script);
+        if (error) {
+            if (error.message.includes('1002') || error.message.includes('not allowed')) {
+                return { success: false, error: 'permission_denied' };
             }
-        });
+            return { success: false, error: error.message };
+        }
+        const result = stdout.trim();
+        if (result === 'success') {
+            return { success: true, message: 'Auto-paste successful' };
+        }
+        if (result.startsWith('not_terminal:')) {
+            return { success: false, error: `frontmost app "${result.slice('not_terminal:'.length)}" is not a terminal — refusing to paste` };
+        }
+        return { success: false, error: result || 'unknown_result' };
     }
 
-    // Method 3: Persistent Notification Injection
-    async tryClipboardWithPersistentNotification(token: string, command: string): Promise<InjectionResult> {
-        return new Promise((resolve) => {
-            this.copyToClipboard(command).then(() => {
-                // Send multiple notifications to ensure user sees them
-                const notifications = [
-                    { delay: 0, sound: 'Basso', message: 'Email command copied! Please paste immediately to Claude Code (Cmd+V)' },
-                    { delay: 3000, sound: 'Ping', message: 'Reminder: Command still in clipboard, please paste and execute' },
-                    { delay: 8000, sound: 'Purr', message: 'Final reminder: Press Cmd+V in Claude Code to paste command' }
-                ];
+    // Method 2: File Drag Injection (manual: the user drags the file into Claude Code)
+    async tryFileDropInjection(token: string, command: string): Promise<InjectionResult> {
+        try {
+            // Create temporary command file
+            const fileName = `taskping-command-${token.replace(/[^A-Za-z0-9_-]/g, '_')}.txt`;
+            const filePath = path.join(this.tempDir, fileName);
 
-                let completedNotifications = 0;
+            fs.writeFileSync(filePath, command);
 
-                notifications.forEach((notif, index) => {
-                    setTimeout(() => {
-                        const script = `
-                            display notification "${notif.message}" with title "TaskPing Persistent Reminder ${index + 1}/3" subtitle "${command.slice(0, 30)}..." sound name "${notif.sound}"
-                        `;
+            // Copy file path to clipboard
+            await this.copyToClipboard(filePath);
 
-                        exec(`osascript -e '${script}'`, () => {
-                            completedNotifications++;
-                            if (completedNotifications === notifications.length) {
-                                resolve({ success: true, message: 'Persistent notification sequence completed' });
-                            }
-                        });
-                    }, notif.delay);
-                });
+            // Send notification to guide user
+            const notified = await this.notify(
+                'Command file created and path copied to clipboard!\n1. Press Cmd+G in Finder and paste path\n2. Drag file to Claude Code window',
+                'TaskPing File Injection',
+                `Drag file: ${fileName}`,
+                'Glass'
+            );
 
-            }).catch((error: Error) => {
-                resolve({ success: false, error: error.message });
+            // Try to open Finder at the target directory
+            await new Promise<void>(resolve => {
+                execFile('open', [this.tempDir], { timeout: 5000 }, () => resolve());
             });
-        });
+
+            if (!notified) {
+                return { success: false, error: 'notification_failed' };
+            }
+            // Nothing was injected — the user still has to drag the file in
+            return { success: false, manual: true, message: `File ${fileName} created, notification sent` };
+        } catch (error: unknown) {
+            return { success: false, error: (error as Error).message };
+        }
     }
 
-    // Method 4: Emergency Clipboard (last resort)
+    // Method 3: Persistent Notification Injection (manual: the user pastes)
+    async tryClipboardWithPersistentNotification(token: string, command: string): Promise<InjectionResult> {
+        try {
+            await this.copyToClipboard(command);
+        } catch (error: unknown) {
+            return { success: false, error: (error as Error).message };
+        }
+
+        // Send multiple notifications to ensure user sees them
+        const notifications = [
+            { delay: 0, sound: 'Basso', message: 'Email command copied! Please paste immediately to Claude Code (Cmd+V)' },
+            { delay: 3000, sound: 'Ping', message: 'Reminder: Command still in clipboard, please paste and execute' },
+            { delay: 8000, sound: 'Purr', message: 'Final reminder: Press Cmd+V in Claude Code to paste command' }
+        ];
+
+        const results = await Promise.all(notifications.map((notif, index) => new Promise<boolean>(resolve => {
+            setTimeout(() => {
+                this.notify(notif.message, `TaskPing Persistent Reminder ${index + 1}/3`, `${command.slice(0, 30)}...`, notif.sound)
+                    .then(resolve);
+            }, notif.delay);
+        })));
+
+        if (!results.some(Boolean)) {
+            return { success: false, error: 'notification_failed' };
+        }
+        return { success: false, manual: true, message: 'Command copied to clipboard, persistent notifications sent' };
+    }
+
+    // Method 4: Emergency Clipboard (last resort, manual: the user pastes)
     async tryUrgentClipboard(token: string, command: string): Promise<InjectionResult> {
-        return new Promise((resolve) => {
-            this.copyToClipboard(command).then(() => {
-                // Create desktop shortcut file
-                const desktopPath = path.join(os.homedir(), 'Desktop');
-                const shortcutContent = `#!/bin/bash
-echo "TaskPing Command: ${command}"
-echo "Copied to clipboard, please press Cmd+V in Claude Code to paste"
-echo "${command}" | pbcopy
-echo "Command refreshed to clipboard"
-`;
+        try {
+            await this.copyToClipboard(command);
+        } catch (error: unknown) {
+            return { success: false, error: (error as Error).message };
+        }
 
-                const shortcutPath = path.join(desktopPath, `TaskPing-${token}.command`);
+        // (No executable Desktop shortcut any more: it embedded the email text in a
+        // shell script, so a crafted command ran when the file was double-clicked.)
+        const notified = await this.notify(
+            'Emergency Mode: command copied to clipboard\nPress Cmd+V in Claude Code to paste it',
+            'TaskPing Emergency Mode',
+            `Command: ${command.slice(0, 20)}...`,
+            'Sosumi'
+        );
+        if (!notified) {
+            return { success: false, error: 'notification_failed' };
+        }
+        return { success: false, manual: true, message: 'Emergency mode: command left in clipboard' };
+    }
 
-                try {
-                    fs.writeFileSync(shortcutPath, shortcutContent);
-                    fs.chmodSync(shortcutPath, '755'); // Executable permission
+    /** Show a macOS notification; every user-derived string is AppleScript-escaped. */
+    async notify(message: string, title: string, subtitle: string, sound: string): Promise<boolean> {
+        if (process.platform !== 'darwin') return false;
+        const script =
+            `display notification ${appleScriptString(message)} with title ${appleScriptString(title)}` +
+            ` subtitle ${appleScriptString(subtitle)} sound name ${appleScriptString(sound)}`;
+        const { error } = await this.runOsascript(script);
+        return !error;
+    }
 
-                    const script = `
-                        display notification "Emergency Mode: Desktop shortcut file TaskPing-${token}.command created\\nDouble-click to re-copy command to clipboard" with title "TaskPing Emergency Mode" subtitle "Command: ${command.slice(0, 20)}..." sound name "Sosumi"
-                    `;
-
-                    exec(`osascript -e '${script}'`, () => {
-                        resolve({ success: true, message: 'Emergency mode: Desktop shortcut file created' });
-                    });
-
-                } catch (error: unknown) {
-                    resolve({ success: false, error: (error as Error).message });
-                }
-
-            }).catch((error: Error) => {
-                resolve({ success: false, error: error.message });
+    /** Run an AppleScript via `osascript -e` (argv, no shell). */
+    runOsascript(script: string): Promise<{ error: Error | null; stdout: string }> {
+        return new Promise(resolve => {
+            execFile('osascript', ['-e', script], { timeout: 10000 }, (error, stdout) => {
+                resolve({ error, stdout: String(stdout || '') });
             });
         });
     }
@@ -227,7 +256,9 @@ echo "Command refreshed to clipboard"
     // Helper method: Copy to clipboard
     async copyToClipboard(text: string): Promise<void> {
         return new Promise((resolve, reject) => {
-            const pbcopy = spawn('pbcopy');
+            const pbcopy = spawn('pbcopy', [], { env: CLIPBOARD_ENV });
+            pbcopy.on('error', reject);
+            pbcopy.stdin.on('error', () => { /* reported via 'close'/'error' */ });
             pbcopy.stdin.write(text);
             pbcopy.stdin.end();
 

@@ -6,8 +6,8 @@
  * BLOCKING mode: Notifies user before context compaction, allows them to
  * block it if they want to preserve context.
  *
- * Stdin JSON: { cwd, session_id, tokens_current, ... }
- * Stdout: { hookSpecificOutput: { decision: "block" } } — to prevent compaction
+ * Stdin JSON: { cwd, session_id, trigger, custom_instructions, ... }
+ * Stdout: { decision: "block", reason } — to prevent compaction
  *         (or exit silently to allow compaction)
  */
 
@@ -15,19 +15,18 @@ import path from 'path';
 import { PROJECT_ROOT } from './src/utils/paths';
 require('dotenv').config({ path: path.join(PROJECT_ROOT, '.env'), quiet: true });
 
-import fs from 'fs';
-import https from 'https';
 import { extractWorkspaceName, trackNotificationMessage } from './workspace-router';
-import { generatePromptId, writePending, cleanPrompt, PROMPTS_DIR } from './prompt-bridge';
-import { isUserActiveAtTerminal } from './src/utils/active-check';
-import type { InlineKeyboardMarkup, InlineKeyboardButton, TelegramMessage } from './src/types';
+import { generatePromptId } from './prompt-bridge';
+import { shouldDeferToTerminal, hookProjectDir } from './src/utils/active-check';
+import {
+  routeConsoleToStderr, readStdin, parsePayload, emitJson, logErr,
+  escapeHtml, truncateText, fitHtml, sendHtmlWithFallback, stopTypingSignal,
+  hookDeadline, openPrompt, closePrompt, installPromptCleanup, pollForResponse,
+  telegramConfigured,
+} from './src/utils/hook-utils';
+import type { InlineKeyboardButton } from './src/types';
 
-const BOT_TOKEN = process.env.TELEGRAM_BOT_TOKEN;
-const CHAT_ID = process.env.TELEGRAM_CHAT_ID;
-
-// Polling configuration
-const POLL_INTERVAL_MS = 500;
-const POLL_TIMEOUT_MS = 30000; // 30 seconds to decide
+const TAG = 'pre-compact-notify';
 
 /** Output format for blocking compaction.
  *
@@ -45,185 +44,96 @@ interface PreCompactOutput {
 // ── Main ────────────────────────────────────────────────────────
 
 async function main(): Promise<void> {
+  routeConsoleToStderr();
+  installPromptCleanup(TAG);
+  const deadline = hookDeadline('pre-compact-notify.js');
+
   const raw = await readStdin();
+  // Telegram off / not configured — no output
+  if (!telegramConfigured()) return;
+  const payload = parsePayload(raw);
+  if (!payload) return;
 
-  // Skip Telegram notification if user is at terminal AND this wasn't Telegram-injected
-  const typingActivePath = path.join(PROJECT_ROOT, 'src/data', 'typing-active');
-  const isTelegramInjected = fs.existsSync(typingActivePath);
-  if (!isTelegramInjected && isUserActiveAtTerminal()) {
-    // User is at terminal — let compaction proceed automatically
+  // Key everything on the project root (stable when Claude cd's into a subdirectory)
+  const dir = hookProjectDir(payload.cwd as string);
+
+  // User is working in this session at the terminal and the turn didn't come from
+  // Telegram — let compaction proceed automatically.
+  if (shouldDeferToTerminal(dir)) {
     return;
   }
 
-  let payload: Record<string, unknown>;
-  try {
-    payload = JSON.parse(raw);
-  } catch {
-    return;
-  }
-
-  const cwd = (payload.cwd as string) || process.cwd();
-  const workspace = extractWorkspaceName(cwd)!;
+  const workspace = extractWorkspaceName(dir) || 'unknown';
   const tokensCurrent = payload.tokens_current as number | undefined;
+  const trigger = typeof payload.trigger === 'string' ? payload.trigger : null;
+  const customInstructions = typeof payload.custom_instructions === 'string' ? payload.custom_instructions : '';
 
   const promptId = generatePromptId();
 
-  let messageText = `\u{1F4E6} *Context Compaction* — ${escapeMarkdown(workspace)}\n\n`;
-  messageText += `Context is getting large and will be compacted.`;
-  if (tokensCurrent) {
-    messageText += `\n\n_Current tokens: ${tokensCurrent.toLocaleString()}_`;
-  }
+  const messageText = fitHtml(budget => {
+    let html = `\u{1F4E6} <b>Context Compaction</b> — ${escapeHtml(truncateText(workspace, 100))}\n\n`;
+    html += trigger === 'manual'
+      ? 'A manual /compact was requested.'
+      : 'Context is getting large and will be compacted.';
+    if (customInstructions) {
+      html += `\n\n<b>Instructions:</b> ${escapeHtml(truncateText(customInstructions, budget))}`;
+    }
+    if (typeof tokensCurrent === 'number') {
+      html += `\n\n<i>Current tokens: ${tokensCurrent.toLocaleString()}</i>`;
+    }
+    return html;
+  }, 1000);
 
   // Build inline keyboard with Proceed/Block buttons
   const keyboard: InlineKeyboardButton[][] = [
     [
-      { text: '\u2705 Proceed', callback_data: `pre-compact:${promptId}:proceed` },
+      { text: '✅ Proceed', callback_data: `pre-compact:${promptId}:proceed` },
       { text: '\u{1F6D1} Block', callback_data: `pre-compact:${promptId}:block` },
     ],
   ];
 
   // Write pending file
-  writePending(promptId, {
+  openPrompt(promptId, {
     type: 'pre-compact',
     workspace,
     tokensCurrent,
   });
 
-  // Send Telegram message
   try {
-    const result = await sendTelegramWithKeyboard(messageText, { inline_keyboard: keyboard });
-    if (result && result.message_id) {
-      trackNotificationMessage(result.message_id, workspace, 'pre-compact');
+    // Send Telegram message (HTML, plain-text retry on failure)
+    try {
+      const result = await sendHtmlWithFallback(messageText, { tag: TAG, replyMarkup: { inline_keyboard: keyboard }, deadlineMs: deadline });
+      stopTypingSignal();
+      if (result && result.message_id) {
+        trackNotificationMessage(result.message_id, workspace, 'pre-compact');
+      }
+    } catch (err: unknown) {
+      logErr(TAG, `Telegram send failed: ${(err as Error).message}`);
+      return; // Let compaction proceed on send failure
     }
-  } catch (err: unknown) {
-    process.stderr.write(`[pre-compact-notify] Telegram send failed: ${(err as Error).message}\n`);
-    cleanPrompt(promptId);
-    return; // Let compaction proceed on send failure
+
+    // Poll for response until the hook's deadline
+    const response = await pollForResponse(promptId, deadline);
+    if (!response) logErr(TAG, 'Timed out — allowing compaction');
+
+    if (response && response.action === 'block') {
+      const output: PreCompactOutput = {
+        decision: 'block',
+        reason: 'User blocked compaction via Telegram to preserve context',
+        hookSpecificOutput: {
+          hookEventName: 'PreCompact',
+        },
+      };
+      emitJson(output);
+    }
+    // If proceed or timeout, exit silently — compaction proceeds
+  } finally {
+    closePrompt(promptId);
   }
-
-  // Poll for response
-  const response = await pollForResponse(promptId);
-  cleanPrompt(promptId);
-
-  if (response && response.action === 'block') {
-    const output: PreCompactOutput = {
-      decision: 'block',
-      reason: 'User blocked compaction via Telegram to preserve context',
-      hookSpecificOutput: {
-        hookEventName: 'PreCompact',
-      },
-    };
-    process.stdout.write(JSON.stringify(output) + '\n');
-  }
-  // If proceed or timeout, exit silently — compaction proceeds
-}
-
-// ── Polling ─────────────────────────────────────────────────────
-
-function pollForResponse(promptId: string): Promise<Record<string, unknown> | null> {
-  return new Promise((resolve) => {
-    const responseFile = path.join(PROMPTS_DIR, `response-${promptId}.json`);
-    const startTime = Date.now();
-
-    const interval = setInterval(() => {
-      if (Date.now() - startTime > POLL_TIMEOUT_MS) {
-        clearInterval(interval);
-        process.stderr.write(`[pre-compact-notify] Timed out — allowing compaction\n`);
-        resolve(null);
-        return;
-      }
-
-      try {
-        if (fs.existsSync(responseFile)) {
-          const raw = fs.readFileSync(responseFile, 'utf8');
-          const data = JSON.parse(raw);
-          clearInterval(interval);
-          resolve(data);
-        }
-      } catch {
-        // File not ready yet or parse error — keep polling
-      }
-    }, POLL_INTERVAL_MS);
-  });
-}
-
-// ── Telegram ────────────────────────────────────────────────────
-
-function sendTelegramWithKeyboard(text: string, replyMarkup: InlineKeyboardMarkup): Promise<TelegramMessage | null> {
-  return new Promise((resolve, reject) => {
-    const body = JSON.stringify({
-      chat_id: CHAT_ID,
-      text,
-      parse_mode: 'Markdown',
-      reply_markup: replyMarkup,
-    });
-
-    const options: https.RequestOptions = {
-      hostname: 'api.telegram.org',
-      path: `/bot${BOT_TOKEN}/sendMessage`,
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        'Content-Length': Buffer.byteLength(body),
-      },
-      timeout: 5000,
-    };
-
-    const req = https.request(options, (res) => {
-      let data = '';
-      res.on('data', (chunk: string) => { data += chunk; });
-      res.on('end', () => {
-        if (res.statusCode! >= 200 && res.statusCode! < 300) {
-          try {
-            const parsed = JSON.parse(data);
-            resolve(parsed.result || null);
-          } catch {
-            resolve(null);
-          }
-        } else {
-          reject(new Error(`Telegram API ${res.statusCode}: ${data}`));
-        }
-      });
-    });
-
-    req.on('error', reject);
-    req.on('timeout', () => {
-      req.destroy();
-      reject(new Error('Telegram request timed out'));
-    });
-
-    req.write(body);
-    req.end();
-  });
-}
-
-// ── Helpers ──────────────────────────────────────────────────────
-
-function readStdin(): Promise<string> {
-  return new Promise((resolve) => {
-    let data = '';
-    let resolved = false;
-    process.stdin.setEncoding('utf8');
-    process.stdin.on('data', (chunk: string) => { data += chunk; });
-    process.stdin.on('end', () => {
-      if (!resolved) { resolved = true; resolve(data); }
-    });
-    setTimeout(() => {
-      if (!resolved) {
-        resolved = true;
-        process.stdin.destroy();
-        resolve(data || '{}');
-      }
-    }, 500);
-  });
-}
-
-function escapeMarkdown(text: string): string {
-  return text.replace(/([_*`\[])/g, '\\$1');
 }
 
 // ── Run ─────────────────────────────────────────────────────────
 
 main().catch((err: Error) => {
-  process.stderr.write(`[pre-compact-notify] Fatal: ${err.message}\n`);
+  logErr(TAG, `Fatal: ${err.message}`);
 });

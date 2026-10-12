@@ -5,7 +5,9 @@
  * tabs, and splits. This backend is used when TERM_PROGRAM=ghostty and no
  * tmux session is available.
  *
- * Session identity: CWD-based. Stores Map<sessionName, cwd> as handles.
+ * Session identity: CWD-based. Stores Map<sessionName, cwd> as handles. If more than
+ * one Ghostty terminal sits in the same cwd the target is ambiguous and every
+ * operation fails (returns false/null) instead of typing into a guessed terminal.
  * Text injection: input text "..." to terminal (paste-style, handles ANSI).
  * Key sequences: arrow keys via ANSI (send key "down" is broken in 1.3.0).
  * Modifier keys (C-c, C-u): use "send key KEY modifiers MOD to term" (no "with").
@@ -13,7 +15,7 @@
 
 import os from 'os';
 import fs from 'fs';
-import { exec, execSync } from 'child_process';
+import { execFile, execFileSync } from 'child_process';
 
 // Key name → macOS key code (sent via System Events after focus, bypasses bracketed paste)
 // send key "down" is unsupported in Ghostty AppleScript; input text ANSI is wrapped in
@@ -36,9 +38,22 @@ const MODIFIER_KEYS: Record<string, { key: string; modifiers: string }> = {
   'C-u': { key: 'u', modifiers: 'control' },
 };
 
+/** Printable ASCII that can sit verbatim inside an AppleScript string literal. */
+function isPlainAscii(code: number): boolean {
+  return code >= 32 && code < 127;
+}
+
+/** Escape `\` and `"` for the inside of an AppleScript "..." literal. */
+function escapeAppleScriptLiteral(str: string): string {
+  return str.replace(/\\/g, '\\\\').replace(/"/g, '\\"');
+}
+
 export class GhosttySessionManager {
   /** Map from session name to registered CWD. */
   private handles: Map<string, string> = new Map();
+
+  /** Message of the most recent failed operation (e.g. the "ambiguous: ..." error), for callers to surface. */
+  lastError: string | null = null;
 
   /**
    * Whether Ghostty is available and running on this machine.
@@ -47,7 +62,7 @@ export class GhosttySessionManager {
   isAvailable(): boolean {
     if (process.platform !== 'darwin') return false;
     try {
-      const result = execSync('osascript -e "application \\"Ghostty\\" is running"', {
+      const result = execFileSync('osascript', ['-e', 'application "Ghostty" is running'], {
         encoding: 'utf8',
         stdio: 'pipe',
         timeout: 2000,
@@ -74,81 +89,128 @@ export class GhosttySessionManager {
   }
 
   /**
-   * Execute an AppleScript via osascript stdin pipe.
-   * Using stdin pipe avoids all shell-quoting issues and supports multi-line scripts.
+   * Execute an AppleScript via osascript stdin pipe (execFile, no shell).
+   * Using stdin pipe avoids all quoting issues and supports multi-line scripts.
    */
   private runScript(script: string): Promise<string> {
     return new Promise((resolve, reject) => {
-      const child = exec('osascript -', { timeout: 5000 }, (err, stdout) => {
-        if (err) reject(err);
-        else resolve(stdout.trim());
+      const child = execFile('osascript', ['-'], { timeout: 5000 }, (err, stdout, stderr) => {
+        if (err) {
+          const detail = String(stderr || '').trim();
+          reject(new Error(detail || err.message));
+        } else {
+          resolve(String(stdout).trim());
+        }
       });
-      child.stdin!.write(script);
-      child.stdin!.end();
+      // osascript missing / killed early → EPIPE on stdin; the exec callback reports the failure
+      child.stdin?.on('error', () => {});
+      child.stdin?.write(script);
+      child.stdin?.end();
     });
   }
 
   /**
-   * Build an AppleScript string literal expression for the given value.
-   * Handles embedded double-quotes via & quote & concatenation.
+   * Run a script that ends with `return "ok"`; true only when it ran to completion.
+   * Any osascript failure (no terminal, ambiguous cwd, Ghostty not running, timeout)
+   * is logged, remembered in `lastError`, and reported as false.
+   */
+  private async runAction(label: string, name: string, script: string): Promise<boolean> {
+    try {
+      const out = await this.runScript(`${script}\nreturn "ok"`);
+      if (out !== 'ok') throw new Error(`unexpected osascript output: ${out || '(empty)'}`);
+      this.lastError = null;
+      return true;
+    } catch (err: unknown) {
+      this.lastError = (err as Error).message;
+      process.stderr.write(`[ghostty-session-manager] ${label} failed for ${name}: ${this.lastError}\n`);
+      return false;
+    }
+  }
+
+  /**
+   * Build an AppleScript string literal expression for the given value
+   * (`\` and `"` escaped; other characters, including CJK, kept verbatim).
    */
   private buildAppleScriptString(str: string): string {
-    const parts = str.split('"');
-    return parts.map(p => `"${p}"`).join(' & quote & ');
+    return `"${escapeAppleScriptLiteral(str)}"`;
   }
 
   /**
    * Build an AppleScript expression that produces the given text when evaluated.
-   * Uses (character id N) for control characters/non-printable bytes,
-   * and quote for embedded double-quotes.
+   * Printable ASCII goes into escaped string literals; every other character
+   * (control chars, ESC sequences, CJK, emoji) is emitted by Unicode *code point*
+   * via (character id N) / (string id {...}). Iterating code points — not UTF-16
+   * units — matters: an emoji's lone surrogate halves (character id 55357) make
+   * osascript fail with -1728.
    */
   private buildAppleScriptText(text: string): string {
     const parts: string[] = [];
-    let current = '';
+    let literal = '';
+    let ids: number[] = [];
 
-    for (let i = 0; i < text.length; i++) {
-      const code = text.charCodeAt(i);
-      if (code >= 32 && code < 127 && code !== 34) {
-        // Printable ASCII except " — include in string literal
-        current += text[i];
-      } else if (code === 34) { // "
-        if (current) { parts.push(`"${current}"`); current = ''; }
-        parts.push('quote');
+    const flushLiteral = () => {
+      if (literal) { parts.push(`"${escapeAppleScriptLiteral(literal)}"`); literal = ''; }
+    };
+    const flushIds = () => {
+      if (ids.length === 1) parts.push(`(character id ${ids[0]})`);
+      else if (ids.length > 1) parts.push(`(string id {${ids.join(', ')}})`);
+      ids = [];
+    };
+
+    for (const ch of text) {
+      const code = ch.codePointAt(0)!;
+      if (isPlainAscii(code)) {
+        flushIds();
+        literal += ch;
       } else {
-        // Control character or non-ASCII — use character id
-        if (current) { parts.push(`"${current}"`); current = ''; }
-        parts.push(`(character id ${code})`);
+        flushLiteral();
+        ids.push(code);
       }
     }
+    flushLiteral();
+    flushIds();
 
-    if (current) parts.push(`"${current}"`);
     if (parts.length === 0) return '""';
     return parts.join(' & ');
   }
 
   /**
    * Build the AppleScript fragment that finds the terminal for a registered CWD.
-   * Iterates all windows and tabs to find the terminal whose working directory matches.
+   * Iterates all windows and tabs and counts terminals whose working directory
+   * matches: none → error, more than one → "ambiguous" error (never guess which
+   * split/tab the user meant).
    */
   private findTermScript(cwd: string): string {
     const cwdExpr = this.buildAppleScriptString(cwd);
     return `set targetCwd to ${cwdExpr}
 set foundTerm to missing value
+set matchCount to 0
 tell application "Ghostty"
   repeat with w in windows
     repeat with t in tabs of w
       repeat with term in terminals of t
         if working directory of term is targetCwd then
-          set foundTerm to term
-          exit repeat
+          set matchCount to matchCount + 1
+          if foundTerm is missing value then set foundTerm to term
         end if
       end repeat
-      if foundTerm is not missing value then exit repeat
     end repeat
-    if foundTerm is not missing value then exit repeat
   end repeat
   if foundTerm is missing value then error "No Ghostty terminal found for cwd: " & targetCwd
+  if matchCount > 1 then error "ambiguous: " & matchCount & " Ghostty terminals in " & targetCwd
 end tell`;
+  }
+
+  /**
+   * Is the registered session still backed by exactly one open Ghostty terminal?
+   * Cheap (one osascript round trip); a closed tab reports false, as does an
+   * ambiguous cwd (see `lastError`).
+   */
+  async hasTerminal(name: string): Promise<boolean> {
+    const cwd = this.handles.get(name);
+    if (!cwd) return false;
+    if (process.platform !== 'darwin') return false;
+    return this.runAction('hasTerminal', name, this.findTermScript(cwd));
   }
 
   /**
@@ -160,18 +222,12 @@ end tell`;
     const cwd = this.handles.get(name);
     if (!cwd) return false;
 
-    try {
-      const textExpr = this.buildAppleScriptText(text);
-      const script = `${this.findTermScript(cwd)}
+    const textExpr = this.buildAppleScriptText(text);
+    const script = `${this.findTermScript(cwd)}
 tell application "Ghostty"
   input text ${textExpr} to foundTerm
 end tell`;
-      await this.runScript(script);
-      return true;
-    } catch (err: unknown) {
-      process.stderr.write(`[ghostty-session-manager] write failed for ${name}: ${(err as Error).message}\n`);
-      return false;
-    }
+    return this.runAction('write', name, script);
   }
 
   /**
@@ -182,21 +238,15 @@ end tell`;
     const cwd = this.handles.get(name);
     if (!cwd) return false;
 
-    try {
-      const textExpr = this.buildAppleScriptText(text);
-      const script = `${this.findTermScript(cwd)}
+    const textExpr = this.buildAppleScriptText(text);
+    const script = `${this.findTermScript(cwd)}
 tell application "Ghostty"
   focus foundTerm
   input text ${textExpr} to foundTerm
   delay 0.1
   send key "enter" to foundTerm
 end tell`;
-      await this.runScript(script);
-      return true;
-    } catch (err: unknown) {
-      process.stderr.write(`[ghostty-session-manager] writeLine failed for ${name}: ${(err as Error).message}\n`);
-      return false;
-    }
+    return this.runAction('writeLine', name, script);
   }
 
   /**
@@ -211,40 +261,27 @@ end tell`;
 
     const modKey = MODIFIER_KEYS[key];
     if (modKey) {
-      try {
-        const script = `${this.findTermScript(cwd)}
+      const script = `${this.findTermScript(cwd)}
 tell application "Ghostty"
   focus foundTerm
   send key "${modKey.key}" modifiers "${modKey.modifiers}" to foundTerm
 end tell`;
-        await this.runScript(script);
-        return true;
-      } catch (err: unknown) {
-        process.stderr.write(`[ghostty-session-manager] sendKey(${key}) failed for ${name}: ${(err as Error).message}\n`);
-        return false;
-      }
+      return this.runAction(`sendKey(${key})`, name, script);
     }
 
     const sendKeyName = SEND_KEYS[key];
     if (sendKeyName) {
-      try {
-        const script = `${this.findTermScript(cwd)}
+      const script = `${this.findTermScript(cwd)}
 tell application "Ghostty"
   focus foundTerm
   send key "${sendKeyName}" to foundTerm
 end tell`;
-        await this.runScript(script);
-        return true;
-      } catch (err: unknown) {
-        process.stderr.write(`[ghostty-session-manager] sendKey(${key}) failed for ${name}: ${(err as Error).message}\n`);
-        return false;
-      }
+      return this.runAction(`sendKey(${key})`, name, script);
     }
 
     const keyCode = KEY_CODES[key];
     if (keyCode !== undefined) {
-      try {
-        const script = `${this.findTermScript(cwd)}
+      const script = `${this.findTermScript(cwd)}
 tell application "Ghostty"
   focus foundTerm
 end tell
@@ -253,12 +290,7 @@ tell application "System Events"
     key code ${keyCode}
   end tell
 end tell`;
-        await this.runScript(script);
-        return true;
-      } catch (err: unknown) {
-        process.stderr.write(`[ghostty-session-manager] sendKey(${key}) failed for ${name}: ${(err as Error).message}\n`);
-        return false;
-      }
+      return this.runAction(`sendKey(${key})`, name, script);
     }
 
     // Unknown key — pass through as text
@@ -297,16 +329,11 @@ end tell`;
     } catch {}
 
     // 2. Trigger write_scrollback_file
-    try {
-      const script = `${this.findTermScript(cwd)}
+    const script = `${this.findTermScript(cwd)}
 tell application "Ghostty"
   perform action "write_scrollback_file" on foundTerm
 end tell`;
-      await this.runScript(script);
-    } catch (err: unknown) {
-      process.stderr.write(`[ghostty-session-manager] capture trigger failed for ${name}: ${(err as Error).message}\n`);
-      return null;
-    }
+    if (!await this.runAction('capture trigger', name, script)) return null;
 
     // 3. Wait up to 1s for a new (or updated) file to appear
     const deadline = Date.now() + 1000;
@@ -338,12 +365,11 @@ end tell`;
    * Uses AppleScript's quoted form of for safe shell quoting of the cwd.
    */
   async openNewTab(cwd: string, command: string): Promise<boolean> {
-    try {
-      // Build AppleScript expression for cwd (used with quoted form of)
-      const cwdExpr = this.buildAppleScriptString(cwd);
-      // Build AppleScript expression for the command (plain text)
-      const cmdExpr = this.buildAppleScriptText(command);
-      const script = `tell application "Ghostty"
+    // Build AppleScript expression for cwd (used with quoted form of)
+    const cwdExpr = this.buildAppleScriptString(cwd);
+    // Build AppleScript expression for the command (plain text)
+    const cmdExpr = this.buildAppleScriptText(command);
+    const script = `tell application "Ghostty"
   if (count of windows) is 0 then error "No Ghostty windows open"
   set w to front window
   perform action "new_tab" on w
@@ -354,12 +380,7 @@ end tell`;
   delay 0.1
   send key "enter" to term
 end tell`;
-      await this.runScript(script);
-      return true;
-    } catch (err: unknown) {
-      process.stderr.write(`[ghostty-session-manager] openNewTab failed: ${(err as Error).message}\n`);
-      return false;
-    }
+    return this.runAction('openNewTab', cwd, script);
   }
 }
 

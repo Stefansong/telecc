@@ -15,6 +15,7 @@
 import fs from 'fs';
 import path from 'path';
 import crypto from 'crypto';
+import { writeJsonAtomic } from './src/utils/atomic-json';
 
 const PROMPTS_DIR = process.env.PROMPTS_DIR || '/tmp/claude-prompts';
 const EXPIRY_MS = 5 * 60 * 1000; // 5 minutes
@@ -32,13 +33,14 @@ function generatePromptId(): string {
 }
 
 /**
- * Write a pending prompt file.
+ * Write a pending prompt file. Records the writing hook's pid so the bot can tell
+ * whether anyone is still waiting for the answer (see isPromptAlive).
  */
 function writePending(id: string, data: Record<string, unknown>): void {
   ensureDir();
   cleanExpired();
   const filePath = path.join(PROMPTS_DIR, `pending-${id}.json`);
-  fs.writeFileSync(filePath, JSON.stringify({ ...data, createdAt: Date.now() }, null, 2));
+  writeJsonAtomic(filePath, { pid: process.pid, ...data, createdAt: Date.now() });
 }
 
 /**
@@ -47,7 +49,7 @@ function writePending(id: string, data: Record<string, unknown>): void {
 function writeResponse(id: string, data: Record<string, unknown>): void {
   ensureDir();
   const filePath = path.join(PROMPTS_DIR, `response-${id}.json`);
-  fs.writeFileSync(filePath, JSON.stringify({ ...data, respondedAt: Date.now() }, null, 2));
+  writeJsonAtomic(filePath, { ...data, respondedAt: Date.now() });
 }
 
 /**
@@ -90,10 +92,11 @@ function hasPendingForWorkspace(workspace: string): boolean {
         const raw = fs.readFileSync(path.join(PROMPTS_DIR, file), 'utf8');
         const data = JSON.parse(raw);
         // Only count non-expired pending files
-        if (data.workspace === workspace && (Date.now() - data.createdAt) < EXPIRY_MS) {
-          // Check that no response exists for this prompt
+        if (data.workspace === workspace) {
+          // Only count prompts a live hook is still waiting on (not expired, not
+          // answered, hook process not killed by its timeout)
           const id = file.replace('pending-', '').replace('.json', '');
-          if (!readResponse(id)) {
+          if (isPromptAlive(id)) {
             return true;
           }
         }
@@ -150,7 +153,55 @@ function updatePending(id: string, updates: Record<string, unknown>): void {
   const existing = readPending(id);
   if (!existing) return;
   const filePath = path.join(PROMPTS_DIR, `pending-${id}.json`);
-  fs.writeFileSync(filePath, JSON.stringify({ ...existing, ...updates }, null, 2));
+  writeJsonAtomic(filePath, { ...existing, ...updates });
+}
+
+/**
+ * Is a hook still waiting on this prompt? False when the pending file is gone or
+ * expired, a response was already written, or the hook process that wrote it has
+ * exited (killed by Claude Code's hook timeout, Esc, session exit...). Buttons on a
+ * dead prompt must not report "Allowed"/"Answered".
+ */
+function isPromptAlive(id: string): boolean {
+  const pending = readPending(id);
+  if (!pending) return false;
+  if (Date.now() - ((pending.createdAt as number) || 0) >= EXPIRY_MS) return false;
+  if (readResponse(id)) return false;
+  const pid = pending.pid as number | undefined;
+  if (typeof pid === 'number' && pid > 0) {
+    try {
+      process.kill(pid, 0);
+    } catch (err: unknown) {
+      // EPERM = exists but not ours; ESRCH = gone
+      if ((err as NodeJS.ErrnoException).code === 'ESRCH') return false;
+    }
+  }
+  return true;
+}
+
+/**
+ * Find a live prompt waiting for a free-text answer (pending has `awaitingText: true`).
+ * With `replyToMessageId`, only the prompt whose Telegram `messageId` matches.
+ * Without it, returns the prompt only when exactly one is waiting (unambiguous).
+ */
+function findAwaitingTextPrompt(replyToMessageId?: number | null): string | null {
+  ensureDir();
+  const candidates: Array<{ id: string; messageId?: number }> = [];
+  try {
+    for (const file of fs.readdirSync(PROMPTS_DIR)) {
+      if (!file.startsWith('pending-') || !file.endsWith('.json')) continue;
+      const id = file.slice('pending-'.length, -'.json'.length);
+      const data = readPending(id);
+      if (!data || data.awaitingText !== true || !isPromptAlive(id)) continue;
+      candidates.push({ id, messageId: data.messageId as number | undefined });
+    }
+  } catch {
+    return null;
+  }
+  if (replyToMessageId) {
+    return candidates.find(c => c.messageId === replyToMessageId)?.id ?? null;
+  }
+  return candidates.length === 1 ? candidates[0].id : null;
 }
 
 export {
@@ -160,6 +211,8 @@ export {
   writeResponse,
   readResponse,
   readPending,
+  isPromptAlive,
+  findAwaitingTextPrompt,
   hasPendingForWorkspace,
   cleanExpired,
   cleanPrompt,

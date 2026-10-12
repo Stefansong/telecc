@@ -10,9 +10,10 @@
 
 import crypto from 'crypto';
 import fs from 'fs';
-import os from 'os';
 import path from 'path';
-import { PROJECT_ROOT } from './src/utils/paths';
+import { execFileSync } from 'child_process';
+import { PROJECT_ROOT, claudeProjectDirs } from './src/utils/paths';
+import { readJsonSafe, writeJsonAtomic, withFileLock } from './src/utils/atomic-json';
 require('dotenv').config({ path: path.join(PROJECT_ROOT, '.env'), quiet: true });
 import Logger from './src/core/logger';
 import type {
@@ -42,27 +43,75 @@ function extractWorkspaceName(cwd: string | null): string | null {
   return path.basename(cwd);
 }
 
-/** Read the session map from disk. */
+/** Coerce a parsed JSON value to a plain object map (anything else counts as empty). */
+function asObjectMap<T>(value: unknown): Record<string, T> {
+  return value && typeof value === 'object' && !Array.isArray(value) ? value as Record<string, T> : {};
+}
+
+/**
+ * Read the session map for a read-modify-write. Throws on I/O errors other than a
+ * missing file, so a transient failure can never be "fixed" by writing back an empty map.
+ * A file that stays unparseable is moved aside by readJsonSafe (data preserved).
+ */
+function readSessionMapForWrite(): SessionMap {
+  return asObjectMap<SessionEntry>(readJsonSafe<unknown>(SESSION_MAP_PATH, {}));
+}
+
+/** Read the session map from disk (read-only callers: errors are logged, never thrown). */
 function readSessionMap(): SessionMap {
   try {
-    const raw = fs.readFileSync(SESSION_MAP_PATH, 'utf8');
-    return JSON.parse(raw);
+    return readSessionMapForWrite();
   } catch (err: unknown) {
-    if (err && typeof err === 'object' && 'code' in err && err.code === 'ENOENT') {
-      return {};
-    }
     logger.error(`Failed to read session map: ${(err as Error).message}`);
     return {};
   }
 }
 
-/** Write the session map to disk. */
+/** Write the session map to disk atomically (temp file + rename). */
 function writeSessionMap(map: SessionMap): void {
-  const dir = path.dirname(SESSION_MAP_PATH);
-  if (!fs.existsSync(dir)) {
-    fs.mkdirSync(dir, { recursive: true });
+  writeJsonAtomic(SESSION_MAP_PATH, map);
+}
+
+/** True once a SessionEnd hook marked this entry ended — never an injection target. */
+function isEnded(session: SessionEntry | Record<string, unknown>): boolean {
+  return !!(session as SessionEntry).endedAt;
+}
+
+function isTmuxEntry(session: SessionEntry): boolean {
+  return session.type === 'tmux' || session.sessionType === 'tmux';
+}
+
+/**
+ * Names of live tmux sessions, or null when liveness can't be determined (tmux hung /
+ * timed out) — callers then skip the liveness filter rather than dropping everything.
+ * No tmux binary or no server running → empty set (every tmux entry is dead).
+ */
+function liveTmuxSessions(): Set<string> | null {
+  try {
+    const out = execFileSync('tmux', ['list-sessions', '-F', '#{session_name}'], {
+      encoding: 'utf8',
+      stdio: ['ignore', 'pipe', 'ignore'],
+      timeout: 2000,
+    });
+    return new Set(out.split('\n').map(s => s.trim()).filter(Boolean));
+  } catch (err: unknown) {
+    const e = err as NodeJS.ErrnoException & { signal?: string };
+    if (e && (e.code === 'ETIMEDOUT' || e.signal === 'SIGTERM')) return null;
+    return new Set();
   }
-  fs.writeFileSync(SESSION_MAP_PATH, JSON.stringify(map, null, 2), 'utf8');
+}
+
+/**
+ * Lazily-evaluated tmux liveness check: only shells out to tmux when the map
+ * actually contains a tmux entry.
+ */
+function tmuxLivenessFilter(): (session: SessionEntry) => boolean {
+  let live: Set<string> | null | undefined;
+  return (session: SessionEntry) => {
+    if (!isTmuxEntry(session) || !session.tmuxSession) return true;
+    if (live === undefined) live = liveTmuxSessions();
+    return live === null || live.has(session.tmuxSession);
+  };
 }
 
 /** Check whether a session has expired. */
@@ -81,7 +130,7 @@ function findSessionByWorkspace(workspaceName: string): { token: string; session
   let best: { token: string; session: SessionEntry } | null = null;
 
   for (const [token, session] of Object.entries(map)) {
-    if (isExpired(session)) continue;
+    if (isExpired(session) || isEnded(session)) continue;
 
     const name = extractWorkspaceName(session.cwd);
     if (name && name.toLowerCase() === workspaceName.toLowerCase()) {
@@ -106,23 +155,15 @@ function listActiveSessions(): Array<{ workspace: string; token: string; session
   // Fork patch: ask the tmux server which sessions still exist, so we can drop
   // entries pointing at panes the user has since closed. Without this, /sessions
   // reports zombies that silently fail when /<workspace> tries to send_keys.
-  let liveTmux = new Set<string>();
-  try {
-    const out = require('child_process').execSync('tmux ls -F "#{session_name}"', {
-      encoding: 'utf8',
-      stdio: ['ignore', 'pipe', 'ignore'],
-    }) as string;
-    liveTmux = new Set(out.split('\n').map(s => s.trim()).filter(Boolean));
-  } catch { /* no tmux server running */ }
+  const isLive = tmuxLivenessFilter();
 
   // Keep only the most recent session per workspace
   const byWorkspace = new Map<string, { token: string; session: SessionEntry }>();
 
   for (const [token, session] of Object.entries(map)) {
-    if (isExpired(session)) continue;
+    if (isExpired(session) || isEnded(session)) continue;
     // Fork patch: drop dead tmux entries
-    const isTmux = (session.type === 'tmux' || (session as any).sessionType === 'tmux');
-    if (isTmux && session.tmuxSession && !liveTmux.has(session.tmuxSession)) continue;
+    if (!isLive(session)) continue;
     const workspace = extractWorkspaceName(session.cwd) || 'unknown';
 
     const existing = byWorkspace.get(workspace);
@@ -150,43 +191,51 @@ function listActiveSessions(): Array<{ workspace: string; token: string; session
  * Register or update a session in the map.
  * Called by the hook notifier when Claude starts/stops.
  */
-function upsertSession({ cwd, tmuxSession, status, sessionId, sessionType, rateLimit }: {
+function upsertSessionUnlocked({ cwd, tmuxSession, status, sessionId, sessionType, rateLimit, tmuxPane }: {
   cwd: string;
   tmuxSession: string;
   status: string;
   sessionId?: string | null;
   sessionType?: 'tmux' | 'pty' | 'ghostty';
   rateLimit?: RateLimitInfo;
+  tmuxPane?: string;
 }): { token: string; workspace: string | null } {
-  const map = readSessionMap();
+  const map = readSessionMapForWrite();
   const workspace = extractWorkspaceName(cwd);
   const now = Math.floor(Date.now() / 1000);
   const expiresAt = now + SESSION_TIMEOUT_HOURS * 3600;
+  const resolvedCwd = path.resolve(cwd);
 
   // Try to find an existing session for this workspace + tmux combo
   let existingToken: string | null = null;
   for (const [token, sess] of Object.entries(map)) {
-    if (sess.cwd === cwd && sess.tmuxSession === tmuxSession && !isExpired(sess)) {
+    if (sess.cwd && path.resolve(sess.cwd) === resolvedCwd && sess.tmuxSession === tmuxSession && !isExpired(sess)) {
       existingToken = token;
       break;
     }
   }
 
   const token = existingToken || generateToken();
+  const existing = existingToken ? map[existingToken] : undefined;
 
   // Preserve existing sessionType if a new one isn't explicitly provided
-  const resolvedSessionType = sessionType ?? (existingToken ? map[existingToken].sessionType : undefined);
+  const resolvedSessionType = sessionType ?? existing?.sessionType;
   // Preserve existing rateLimit if a new one isn't provided
-  const resolvedRateLimit = rateLimit ?? (existingToken ? map[existingToken].rateLimit : undefined);
+  const resolvedRateLimit = rateLimit ?? existing?.rateLimit;
+  // Preserve the recorded pane if the caller doesn't know it (e.g. not running in tmux)
+  const resolvedPane = tmuxPane || existing?.tmuxPane;
 
+  // Built fresh (no spread of `existing`), so a previous endedAt is cleared:
+  // a hook firing for this cwd means the session is alive again.
   map[token] = {
     type: resolvedSessionType || 'tmux',
     ...(resolvedSessionType !== undefined ? { sessionType: resolvedSessionType } : {}),
-    createdAt: existingToken ? map[existingToken].createdAt : now,
+    createdAt: existing ? existing.createdAt : now,
     expiresAt,
     cwd,
-    sessionId: sessionId || (existingToken ? map[existingToken].sessionId : null) || null,
+    sessionId: sessionId || existing?.sessionId || null,
     tmuxSession: tmuxSession || `claude-${workspace}`,
+    ...(resolvedPane ? { tmuxPane: resolvedPane } : {}),
     description: `${status} - ${workspace}`,
     ...(resolvedRateLimit ? { rateLimit: resolvedRateLimit } : {}),
   };
@@ -197,11 +246,32 @@ function upsertSession({ cwd, tmuxSession, status, sessionId, sessionType, rateL
 }
 
 /**
+ * Mark the session that exited in `cwd` as ended (SessionEnd hook). Ended entries stay
+ * in the map (history, /clear) but are skipped by every routing lookup until an
+ * upsertSession for the same cwd revives them.
+ */
+function markSessionEndedUnlocked(cwd: string, opts: { sessionId?: string | null; tmuxPane?: string | null } = {}): void {
+  if (!cwd) return;
+  const map = readSessionMapForWrite();
+  const resolvedCwd = path.resolve(cwd);
+  const now = Math.floor(Date.now() / 1000);
+  const sameCwd = Object.values(map).filter(s => s.cwd && path.resolve(s.cwd) === resolvedCwd && !s.endedAt);
+  // Only end the session that actually exited: another Claude may be running in the
+  // same directory. Narrow by tmux pane, then by Claude session id; if neither
+  // identifies an entry, fall back to cwd only when it's unambiguous.
+  let targets = opts.tmuxPane ? sameCwd.filter(s => s.tmuxPane === opts.tmuxPane) : [];
+  if (!targets.length && opts.sessionId) targets = sameCwd.filter(s => s.sessionId === opts.sessionId);
+  if (!targets.length && sameCwd.length === 1) targets = sameCwd;
+  for (const session of targets) session.endedAt = now;
+  if (targets.length) writeSessionMap(map);
+}
+
+/**
  * Update rate limit info for a session by workspace name.
  * Returns true if session was found and updated.
  */
-function updateSessionRateLimit(workspace: string, rateLimit: RateLimitInfo): boolean {
-  const map = readSessionMap();
+function updateSessionRateLimitUnlocked(workspace: string, rateLimit: RateLimitInfo): boolean {
+  const map = readSessionMapForWrite();
   for (const [token, session] of Object.entries(map)) {
     if (isExpired(session)) continue;
     const sessionWorkspace = extractWorkspaceName(session.cwd);
@@ -230,14 +300,16 @@ function getSessionRateLimit(workspace: string): RateLimitInfo | undefined {
 }
 
 /**
- * Find the newest non-expired session with the given tmuxSession name.
+ * Find the newest live (non-expired, non-ended) session with exactly this tmuxSession name.
  * Used by callback handlers that only have the session name from pending files.
  */
 function findSessionByTmuxName(tmuxName: string): SessionEntry | undefined {
+  if (!tmuxName) return undefined;
   const map = readSessionMap();
   let best: SessionEntry | undefined;
   for (const session of Object.values(map)) {
-    if (isExpired(session)) continue;
+    if (isExpired(session) || isEnded(session)) continue;
+    // Exact match only — never prefix (tmux's own `-t name` would prefix-match).
     if (session.tmuxSession === tmuxName) {
       if (!best || session.createdAt > best.createdAt) best = session;
     }
@@ -246,8 +318,14 @@ function findSessionByTmuxName(tmuxName: string): SessionEntry | undefined {
 }
 
 /** Remove expired sessions from the map. */
-function pruneExpired(): number {
-  const map = readSessionMap();
+function pruneExpiredUnlocked(): number {
+  let map: SessionMap;
+  try {
+    map = readSessionMapForWrite();
+  } catch (err: unknown) {
+    logger.error(`Failed to read session map for pruning: ${(err as Error).message}`);
+    return 0;
+  }
   let pruned = 0;
   for (const [token, session] of Object.entries(map)) {
     if (isExpired(session)) {
@@ -280,30 +358,25 @@ const DEFAULT_WORKSPACE_PATH = process.env.DEFAULT_WORKSPACE_PATH || path.join(D
 const MESSAGE_WORKSPACE_MAP_PATH = process.env.MESSAGE_WORKSPACE_MAP_PATH || path.join(DATA_DIR, 'message-workspace-map.json');
 
 /**
- * Resolve a workspace name by exact match, then prefix match.
+ * Resolve a workspace name by exact match, then (unless `allowPrefix: false`) prefix match.
+ * Callers acting on a name the user didn't type in full (e.g. a stored name) should
+ * pass `allowPrefix: false` so "api" can never silently resolve to "api-server".
  */
-function resolveWorkspace(name: string): ResolveResult {
+function resolveWorkspace(name: string, opts: { allowPrefix?: boolean } = {}): ResolveResult {
+  const allowPrefix = opts.allowPrefix !== false;
   const map = readSessionMap();
   const lower = name.toLowerCase();
 
   // Fork patch: same tmux liveness check as listActiveSessions, so we don't route
   // /<workspace> commands to a pane the user already closed.
-  let liveTmux = new Set<string>();
-  try {
-    const out = require('child_process').execSync('tmux ls -F "#{session_name}"', {
-      encoding: 'utf8',
-      stdio: ['ignore', 'pipe', 'ignore'],
-    }) as string;
-    liveTmux = new Set(out.split('\n').map(s => s.trim()).filter(Boolean));
-  } catch { /* no tmux server */ }
+  const isLive = tmuxLivenessFilter();
 
   // Build deduplicated workspace → { token, session } map (newest wins)
   const byWorkspace = new Map<string, { workspace: string; token: string; session: SessionEntry }>();
   for (const [token, session] of Object.entries(map)) {
-    if (isExpired(session)) continue;
+    if (isExpired(session) || isEnded(session)) continue;
     // Fork patch: drop dead tmux entries
-    const isTmux = (session.type === 'tmux' || (session as any).sessionType === 'tmux');
-    if (isTmux && session.tmuxSession && !liveTmux.has(session.tmuxSession)) continue;
+    if (!isLive(session)) continue;
     const ws = extractWorkspaceName(session.cwd);
     if (!ws) continue;
     const existing = byWorkspace.get(ws.toLowerCase());
@@ -317,6 +390,8 @@ function resolveWorkspace(name: string): ResolveResult {
   if (exact) {
     return { type: 'exact', match: { token: exact.token, session: exact.session }, workspace: exact.workspace };
   }
+
+  if (!allowPrefix || !lower) return { type: 'none' };
 
   // Prefix match
   const prefixMatches: Array<{ workspace: string; token: string; session: SessionEntry }> = [];
@@ -345,21 +420,16 @@ function resolveWorkspace(name: string): ResolveResult {
 
 function getDefaultWorkspace(): string | null {
   try {
-    const raw = fs.readFileSync(DEFAULT_WORKSPACE_PATH, 'utf8');
-    const data = JSON.parse(raw);
-    return data.workspace || null;
+    const data = readJsonSafe<{ workspace?: unknown } | null>(DEFAULT_WORKSPACE_PATH, null);
+    return data && typeof data.workspace === 'string' && data.workspace ? data.workspace : null;
   } catch {
     return null;
   }
 }
 
 function setDefaultWorkspace(name: string | null): void {
-  const dir = path.dirname(DEFAULT_WORKSPACE_PATH);
-  if (!fs.existsSync(dir)) {
-    fs.mkdirSync(dir, { recursive: true });
-  }
   if (name) {
-    fs.writeFileSync(DEFAULT_WORKSPACE_PATH, JSON.stringify({ workspace: name }, null, 2), 'utf8');
+    writeJsonAtomic(DEFAULT_WORKSPACE_PATH, { workspace: name });
   } else {
     // Clear default
     try { fs.unlinkSync(DEFAULT_WORKSPACE_PATH); } catch {}
@@ -370,30 +440,29 @@ function setDefaultWorkspace(name: string | null): void {
 
 const MESSAGE_MAP_MAX_AGE_MS = 24 * 60 * 60 * 1000; // 24 hours
 
+/** Read the message map; throws on I/O errors (see readSessionMapForWrite). */
 function readMessageMap(): MessageWorkspaceMap {
-  try {
-    const raw = fs.readFileSync(MESSAGE_WORKSPACE_MAP_PATH, 'utf8');
-    return JSON.parse(raw);
-  } catch {
-    return {};
-  }
+  return asObjectMap<MessageWorkspaceEntry>(readJsonSafe<unknown>(MESSAGE_WORKSPACE_MAP_PATH, {}));
 }
 
 function writeMessageMap(map: MessageWorkspaceMap): void {
-  const dir = path.dirname(MESSAGE_WORKSPACE_MAP_PATH);
-  if (!fs.existsSync(dir)) {
-    fs.mkdirSync(dir, { recursive: true });
-  }
-  fs.writeFileSync(MESSAGE_WORKSPACE_MAP_PATH, JSON.stringify(map, null, 2), 'utf8');
+  writeJsonAtomic(MESSAGE_WORKSPACE_MAP_PATH, map);
 }
 
 /**
  * Track which Telegram message_id belongs to which workspace.
  * Prunes entries older than 24 hours on each write.
  */
-function trackNotificationMessage(messageId: number | string, workspace: string, type: string): void {
+function trackNotificationMessageUnlocked(messageId: number | string, workspace: string, type: string): void {
   if (!messageId || !workspace) return;
-  const map = readMessageMap();
+  let map: MessageWorkspaceMap;
+  try {
+    map = readMessageMap();
+  } catch (err: unknown) {
+    // Best-effort tracking: skip rather than overwrite the file with a near-empty map
+    logger.error(`Failed to read message map: ${(err as Error).message}`);
+    return;
+  }
   const now = Date.now();
 
   // Prune old entries
@@ -413,9 +482,10 @@ function trackNotificationMessage(messageId: number | string, workspace: string,
  */
 function getWorkspaceForMessage(messageId: number | string | null | undefined): string | null {
   if (!messageId) return null;
-  const map = readMessageMap();
+  let map: MessageWorkspaceMap;
+  try { map = readMessageMap(); } catch { return null; }
   const entry = map[String(messageId)];
-  if (!entry) return null;
+  if (!entry || typeof entry.timestamp !== 'number') return null;
   if (Date.now() - entry.timestamp > MESSAGE_MAP_MAX_AGE_MS) return null;
   return entry.workspace;
 }
@@ -424,16 +494,31 @@ function getWorkspaceForMessage(messageId: number | string | null | undefined): 
 
 const PROJECT_HISTORY_PATH = process.env.PROJECT_HISTORY_PATH || path.join(DATA_DIR, 'project-history.json');
 
+/** Read project history; throws on I/O errors (see readSessionMapForWrite). */
+function readProjectHistoryForWrite(): ProjectHistoryMap {
+  return asObjectMap<ProjectHistoryMap[string]>(readJsonSafe<unknown>(PROJECT_HISTORY_PATH, {}));
+}
+
 function readProjectHistory(): ProjectHistoryMap {
   try {
-    return JSON.parse(fs.readFileSync(PROJECT_HISTORY_PATH, 'utf8'));
-  } catch { return {}; }
+    return readProjectHistoryForWrite();
+  } catch (err: unknown) {
+    logger.error(`Failed to read project history: ${(err as Error).message}`);
+    return {};
+  }
 }
 
 const MAX_SESSION_HISTORY = 5;
 
-function recordProjectUsage(name: string, projectPath: string, sessionId?: string | null): void {
-  const history = readProjectHistory();
+function recordProjectUsageUnlocked(name: string, projectPath: string, sessionId?: string | null): void {
+  let history: ProjectHistoryMap;
+  try {
+    history = readProjectHistoryForWrite();
+  } catch (err: unknown) {
+    // Best-effort: never replace the history file with a near-empty map on a read error
+    logger.error(`Failed to read project history: ${(err as Error).message}`);
+    return;
+  }
   const existing = history[name];
   const existingSessions: SessionHistoryEntry[] = existing?.sessions || [];
 
@@ -450,9 +535,7 @@ function recordProjectUsage(name: string, projectPath: string, sessionId?: strin
   history[name] = { path: projectPath, lastUsed: Date.now(), sessions };
   const entries = Object.entries(history).sort((a, b) => b[1].lastUsed - a[1].lastUsed);
   const trimmed = Object.fromEntries(entries.slice(0, 50));
-  const dir = path.dirname(PROJECT_HISTORY_PATH);
-  if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
-  fs.writeFileSync(PROJECT_HISTORY_PATH, JSON.stringify(trimmed, null, 2), 'utf8');
+  writeJsonAtomic(PROJECT_HISTORY_PATH, trimmed);
 }
 
 const PINNED_PROJECTS = ['assistant', 'telecc'];
@@ -557,22 +640,19 @@ function getClaudeSessionsForProject(
   projectPath: string,
   limit: number = 5,
 ): Array<{ id: string; lastActivity: number; snippet: string | null }> {
-  const home = process.env.HOME || os.homedir();
-  // Claude Code encodes project paths by replacing every non-[a-zA-Z0-9.] char
-  // (including unicode like Chinese characters AND underscores) with a dash.
-  // Original ccgram only replaced "/" — fork patch: handle the full alphabet.
-  const encoded = projectPath.replace(/[^a-zA-Z0-9.]/g, '-');
-  const sessionDir = path.join(home, '.claude', 'projects', encoded);
-
-  let files: string[];
-  try {
-    const entries = fs.readdirSync(sessionDir, { withFileTypes: true });
-    files = entries
-      .filter(e => e.isFile() && e.name.endsWith('.jsonl'))
-      .map(e => path.join(sessionDir, e.name));
-  } catch {
-    return [];
+  // Claude Code encodes project paths by replacing every non-alphanumeric char
+  // (including unicode like Chinese characters, underscores and — in current
+  // builds — dots) with a dash. claudeProjectDirs() returns both spellings.
+  const files: string[] = [];
+  for (const sessionDir of claudeProjectDirs(projectPath)) {
+    try {
+      const entries = fs.readdirSync(sessionDir, { withFileTypes: true });
+      for (const e of entries) {
+        if (e.isFile() && e.name.endsWith('.jsonl')) files.push(path.join(sessionDir, e.name));
+      }
+    } catch { /* directory doesn't exist for this spelling */ }
   }
+  if (files.length === 0) return [];
 
   const withMtime = files
     .map(f => {
@@ -624,17 +704,58 @@ function getClaudeSessionsForProject(
   return results;
 }
 
+// ── Locked read-modify-write wrappers ───────────────────────────
+// The bot and several concurrent hook processes all update these files; the lock
+// keeps one process from overwriting another's update with stale data.
+
+function upsertSession(args: Parameters<typeof upsertSessionUnlocked>[0]): ReturnType<typeof upsertSessionUnlocked> {
+  return withFileLock(SESSION_MAP_PATH, () => upsertSessionUnlocked(args));
+}
+
+function markSessionEnded(cwd: string, opts: { sessionId?: string | null; tmuxPane?: string | null } = {}): void {
+  withFileLock(SESSION_MAP_PATH, () => markSessionEndedUnlocked(cwd, opts));
+}
+
+function updateSessionRateLimit(workspace: string, rateLimit: RateLimitInfo): boolean {
+  return withFileLock(SESSION_MAP_PATH, () => updateSessionRateLimitUnlocked(workspace, rateLimit));
+}
+
+function pruneExpired(): number {
+  return withFileLock(SESSION_MAP_PATH, () => pruneExpiredUnlocked());
+}
+
+/** Locked read-modify-write of the whole session map (mutate in place or return a new map). */
+function updateSessionMap(mutate: (map: SessionMap) => SessionMap | void): SessionMap {
+  return withFileLock(SESSION_MAP_PATH, () => {
+    const map = readSessionMapForWrite();
+    const next = mutate(map) || map;
+    writeSessionMap(next);
+    return next;
+  });
+}
+
+function trackNotificationMessage(messageId: number | string, workspace: string, type: string): void {
+  withFileLock(MESSAGE_WORKSPACE_MAP_PATH, () => trackNotificationMessageUnlocked(messageId, workspace, type));
+}
+
+function recordProjectUsage(name: string, projectPath: string, sessionId?: string | null): void {
+  withFileLock(PROJECT_HISTORY_PATH, () => recordProjectUsageUnlocked(name, projectPath, sessionId));
+}
+
 export {
   extractWorkspaceName,
   readSessionMap,
   writeSessionMap,
+  updateSessionMap,
   findSessionByWorkspace,
   findSessionByTmuxName,
   resolveWorkspace,
   listActiveSessions,
   upsertSession,
+  markSessionEnded,
   pruneExpired,
   isExpired,
+  isEnded,
   getDefaultWorkspace,
   setDefaultWorkspace,
   trackNotificationMessage,

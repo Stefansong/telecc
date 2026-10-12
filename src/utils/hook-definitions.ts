@@ -46,3 +46,13 @@ export const HOOK_DEFINITIONS: HookDefinition[] = [
 export function uniqueHookScripts(): string[] {
   return Array.from(new Set(HOOK_DEFINITIONS.map(h => h.script)));
 }
+
+/**
+ * Timeout (seconds) Claude Code enforces on a hook script, as installed from HOOK_DEFINITIONS.
+ * `args` disambiguates the multi-mode enhanced-hook-notify.js. Hooks use this to finish
+ * their own waits before Claude Code kills them.
+ */
+export function hookTimeoutSeconds(script: string, args?: string, fallback: number = 60): number {
+  const def = HOOK_DEFINITIONS.find(h => h.script === script && (args === undefined || h.args === args));
+  return def ? def.timeout : fallback;
+}

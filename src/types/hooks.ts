@@ -39,11 +39,39 @@ export interface ToolInputAskUser {
   questions: AskUserQuestionItem[];
 }
 
+/**
+ * Permission update entry — used by both PermissionRequest input `permission_suggestions`
+ * and decision output `updatedPermissions` (Claude Code hooks reference, "Permission
+ * update entries"). `destination`: session | localSettings | projectSettings | userSettings.
+ */
+export interface PermissionUpdateEntry {
+  type: 'addRules' | 'replaceRules' | 'removeRules' | 'setMode' | 'addDirectories' | 'removeDirectories';
+  destination: 'session' | 'localSettings' | 'projectSettings' | 'userSettings';
+  rules?: Array<{ toolName: string; ruleContent?: string }>;
+  behavior?: 'allow' | 'deny' | 'ask';
+  mode?: string;
+  directories?: string[];
+}
+
+export interface PermissionRequestStdin extends HookStdinBase {
+  permission_mode?: string;
+  /** Optional; the permission updates Claude Code suggests for this request. */
+  permission_suggestions?: PermissionUpdateEntry[];
+}
+
 export interface PermissionHookOutput {
   hookSpecificOutput: {
     hookEventName: 'PermissionRequest';
     decision: {
       behavior: 'allow' | 'deny';
+      /** allow only: replaces the tool input */
+      updatedInput?: Record<string, unknown>;
+      /** allow only: permission updates to apply (e.g. echo of permission_suggestions) */
+      updatedPermissions?: PermissionUpdateEntry[];
+      /** deny only: tells Claude why */
+      message?: string;
+      /** deny only: true stops Claude */
+      interrupt?: boolean;
     };
   };
   systemMessage?: string;

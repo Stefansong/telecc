@@ -1,24 +1,40 @@
 /**
- * active-check.ts — Detects whether the user is actively working at the terminal.
+ * active-check.ts — Decides whether a hook should leave a prompt/notification to the
+ * terminal (user is there) or route it to Telegram.
  *
- * Reads /tmp/claude_last_msg_time (written by the UserPromptSubmit hook in
- * ~/.claude/settings.json) to determine when the user last sent a message to Claude.
+ * Per-session via remote-state, keyed by the session's PROJECT ROOT — pass
+ * `hookProjectDir(payload.cwd)`, never the raw payload cwd (it changes when Claude
+ * `cd`s into a subdirectory):
+ *  - isRemoteDriven(dir): the current turn was injected from Telegram → always Telegram
+ *  - isLocallyActive(dir): the user typed into THIS session within the threshold
+ *    (default 300 s, ACTIVE_THRESHOLD_SECONDS) → the terminal handles it
  *
- * If the gap is below ACTIVE_THRESHOLD_SECONDS (default: 300 = 5 min), the user
- * is considered active at the terminal and Telegram notifications should be
- * suppressed (they can see the output directly).
- *
- * Applied to: enhanced-hook-notify (Stop/Notification), permission-hook (PermissionRequest).
- * Skipped when: typing-active file exists (command was Telegram-injected).
+ * `src/data/typing-active` carries no routing meaning any more — it is only the bot's
+ * typing-indicator signal.
  */
 
 import fs from 'fs';
+import { isRemoteDriven, isLocallyActive, hookProjectDir } from './remote-state';
+
+export { isRemoteDriven, isLocallyActive, hookProjectDir };
+
+/**
+ * True when Claude Code's own terminal UI should handle the prompt for the session
+ * rooted at `dir` (= hookProjectDir(payload.cwd)): the user is working in that session
+ * locally and the current turn did not come from Telegram. Otherwise the hook routes
+ * it to Telegram.
+ */
+export function shouldDeferToTerminal(dir: string, thresholdSeconds?: number): boolean {
+  return !isRemoteDriven(dir) && isLocallyActive(dir, thresholdSeconds);
+}
 
 const LAST_MSG_FILE = '/tmp/claude_last_msg_time';
 const DEFAULT_THRESHOLD = 300; // 5 minutes
 
 /**
- * Returns true if the user sent a Claude message within the active threshold.
+ * @deprecated Global (not per-session) — use shouldDeferToTerminal(cwd) / isLocallyActive(cwd).
+ * Reads /tmp/claude_last_msg_time, which user-prompt-hook still writes for locally typed
+ * prompts for backwards compatibility.
  * @param thresholdSeconds - seconds since last message to consider user "active" (default 300)
  */
 export function isUserActiveAtTerminal(

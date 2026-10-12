@@ -3,12 +3,13 @@
  * developer-useful status info (model, context %, last assistant message, etc.)
  *
  * Path: ~/.claude/projects/<encoded-cwd>/<sessionId>.jsonl
- * Encoding: cwd with `/` replaced by `-` (so `/Users/foo/bar` → `-Users-foo-bar`)
+ * Encoding: every non-alphanumeric char of the cwd (`/`, `_`, spaces, CJK, ...) becomes
+ * `-`; older Claude Code builds kept `.`. See claudeProjectDirs() — both are tried.
  */
 
 import fs from 'fs';
-import os from 'os';
 import path from 'path';
+import { claudeProjectDirs } from './paths';
 
 /** Status fields parsed from a session transcript. */
 export interface TranscriptStatus {
@@ -30,15 +31,22 @@ export interface TranscriptStatus {
   lastAssistantTimestamp?: string;
 }
 
-/** Encode a cwd into Claude Code's project directory name. */
+/** Encode a cwd into Claude Code's project directory name (current spelling). */
 export function encodeCwd(cwd: string): string {
-  return cwd.replace(/\//g, '-');
+  return cwd.replace(/[^a-zA-Z0-9]/g, '-');
 }
 
-/** Build the full path to a session's JSONL transcript. */
+/**
+ * Build the full path to a session's JSONL transcript. Returns the first candidate
+ * project dir that has the file, else the path under the current encoding.
+ */
 export function getTranscriptPath(cwd: string, sessionId: string): string {
-  const encoded = encodeCwd(cwd);
-  return path.join(os.homedir(), '.claude', 'projects', encoded, `${sessionId}.jsonl`);
+  const dirs = claudeProjectDirs(cwd);
+  for (const dir of dirs) {
+    const candidate = path.join(dir, `${sessionId}.jsonl`);
+    if (fs.existsSync(candidate)) return candidate;
+  }
+  return path.join(dirs[0], `${sessionId}.jsonl`);
 }
 
 /**
@@ -46,19 +54,20 @@ export function getTranscriptPath(cwd: string, sessionId: string): string {
  * Returns null if no transcripts exist for that cwd.
  */
 export function findLatestTranscript(cwd: string): { sessionId: string; path: string; mtimeMs: number } | null {
-  const dir = path.join(os.homedir(), '.claude', 'projects', encodeCwd(cwd));
-  if (!fs.existsSync(dir)) return null;
-
   let latest: { sessionId: string; path: string; mtimeMs: number } | null = null;
-  for (const entry of fs.readdirSync(dir)) {
-    if (!entry.endsWith('.jsonl')) continue;
-    const full = path.join(dir, entry);
-    try {
-      const mtimeMs = fs.statSync(full).mtimeMs;
-      if (!latest || mtimeMs > latest.mtimeMs) {
-        latest = { sessionId: entry.replace(/\.jsonl$/, ''), path: full, mtimeMs };
-      }
-    } catch {}
+  for (const dir of claudeProjectDirs(cwd)) {
+    let entries: string[];
+    try { entries = fs.readdirSync(dir); } catch { continue; }
+    for (const entry of entries) {
+      if (!entry.endsWith('.jsonl')) continue;
+      const full = path.join(dir, entry);
+      try {
+        const mtimeMs = fs.statSync(full).mtimeMs;
+        if (!latest || mtimeMs > latest.mtimeMs) {
+          latest = { sessionId: entry.replace(/\.jsonl$/, ''), path: full, mtimeMs };
+        }
+      } catch {}
+    }
   }
   return latest;
 }

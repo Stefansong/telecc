@@ -27,6 +27,10 @@ export interface SessionEntry {
   cwd: string;
   sessionId: string | null;
   tmuxSession: string;
+  /** tmux pane id ($TMUX_PANE, e.g. "%12") Claude runs in — targets the right pane when the window is split */
+  tmuxPane?: string;
+  /** Unix SECONDS when a SessionEnd hook fired; ended sessions are never injection targets */
+  endedAt?: number;
   description: string;
   /** Rate limit info from Claude Code (v2.1.80+) */
   rateLimit?: RateLimitInfo;

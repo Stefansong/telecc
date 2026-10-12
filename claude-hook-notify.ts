@@ -11,6 +11,13 @@ import dotenv from 'dotenv';
 import { PROJECT_ROOT } from './src/utils/paths';
 import Logger from './src/core/logger';
 
+// Hook stdout is parsed by Claude Code — route every console log line (Logger uses
+// console.log for debug/info, and so may the channel modules) to stderr.
+const logToStderr = (...args: unknown[]): void => { console.error(...args); };
+console.log = logToStderr;
+console.info = logToStderr;
+console.debug = logToStderr;
+
 const logger = new Logger('hook:notify');
 
 // Load environment variables from the project directory
@@ -22,7 +29,7 @@ logger.debug('Looking for .env at:', envPath);
 
 if (fs.existsSync(envPath)) {
     logger.debug('.env file found, loading...');
-    dotenv.config({ path: envPath });
+    dotenv.config({ path: envPath, quiet: true });
 } else {
     logger.error('.env file not found at:', envPath);
     logger.error('Available files in script directory:');

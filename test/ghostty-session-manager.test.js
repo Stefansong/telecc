@@ -6,12 +6,31 @@ vi.mock('child_process', async (importOriginal) => {
   const actual = await importOriginal();
   return {
     ...actual,
-    execSync: vi.fn(),
-    exec: vi.fn(),
+    execFileSync: vi.fn(),
+    execFile: vi.fn(),
   };
 });
 
-import { execSync, exec } from 'child_process';
+import { execFileSync, execFile } from 'child_process';
+
+/**
+ * Make the mocked execFile behave like `osascript -` : capture the script written
+ * to stdin and complete with the given result when stdin is closed.
+ */
+function mockOsascript({ stdout = 'ok\n', error = null, stderr = '' } = {}) {
+  const scripts = [];
+  execFile.mockImplementation((file, args, opts, cb) => {
+    let script = '';
+    return {
+      stdin: {
+        on: vi.fn(),
+        write: vi.fn((chunk) => { script += chunk; }),
+        end: vi.fn(() => { scripts.push({ file, args, script }); cb(error, stdout, stderr); }),
+      },
+    };
+  });
+  return scripts;
+}
 
 describe('GhosttySessionManager', () => {
   let manager;
@@ -31,7 +50,7 @@ describe('GhosttySessionManager', () => {
     it('returns false on non-darwin platform', () => {
       Object.defineProperty(process, 'platform', { value: 'linux', configurable: true });
       expect(manager.isAvailable()).toBe(false);
-      expect(execSync).not.toHaveBeenCalled();
+      expect(execFileSync).not.toHaveBeenCalled();
     });
 
     it('returns false on win32 platform', () => {
@@ -41,19 +60,21 @@ describe('GhosttySessionManager', () => {
 
     it('returns true when osascript reports Ghostty is running', () => {
       Object.defineProperty(process, 'platform', { value: 'darwin', configurable: true });
-      execSync.mockReturnValue('true\n');
+      execFileSync.mockReturnValue('true\n');
       expect(manager.isAvailable()).toBe(true);
+      // argv, no shell string
+      expect(execFileSync).toHaveBeenCalledWith('osascript', ['-e', 'application "Ghostty" is running'], expect.any(Object));
     });
 
     it('returns false when osascript reports Ghostty is not running', () => {
       Object.defineProperty(process, 'platform', { value: 'darwin', configurable: true });
-      execSync.mockReturnValue('false\n');
+      execFileSync.mockReturnValue('false\n');
       expect(manager.isAvailable()).toBe(false);
     });
 
     it('returns false when osascript throws', () => {
       Object.defineProperty(process, 'platform', { value: 'darwin', configurable: true });
-      execSync.mockImplementation(() => { throw new Error('osascript failed'); });
+      execFileSync.mockImplementation(() => { throw new Error('osascript failed'); });
       expect(manager.isAvailable()).toBe(false);
     });
   });
@@ -127,6 +148,97 @@ describe('GhosttySessionManager', () => {
     it('returns null when session not registered', async () => {
       const result = await manager.capture('unregistered');
       expect(result).toBeNull();
+    });
+  });
+
+  describe('AppleScript text escaping', () => {
+    it('emits emoji by code point, never as lone UTF-16 surrogates', () => {
+      const expr = manager.buildAppleScriptText('hi 😀');
+      expect(expr).toContain('(character id 128512)');
+      expect(expr).not.toMatch(/character id 5\d{4}\b/); // 55357 / 56832 surrogate halves
+      expect(expr).toBe('"hi " & (character id 128512)');
+    });
+
+    it('groups runs of non-ASCII (CJK, emoji sequences) into one string id list', () => {
+      expect(manager.buildAppleScriptText('中文')).toBe('(string id {20013, 25991})');
+      expect(manager.buildAppleScriptText('👍🏽')).toBe('(string id {128077, 127997})');
+    });
+
+    it('escapes backslashes and double quotes inside literals', () => {
+      expect(manager.buildAppleScriptText('a\\b')).toBe('"a\\\\b"');
+      expect(manager.buildAppleScriptText('say "hi"')).toBe('"say \\"hi\\""');
+      expect(manager.buildAppleScriptText('end\\')).toBe('"end\\\\"');
+    });
+
+    it('emits control characters (Enter, ESC sequences) by id', () => {
+      expect(manager.buildAppleScriptText('\x1b[B\r')).toBe('(character id 27) & "[B" & (character id 13)');
+    });
+
+    it('returns an empty literal for empty text', () => {
+      expect(manager.buildAppleScriptText('')).toBe('""');
+    });
+
+    it('escapes backslashes and quotes in cwd literals', () => {
+      expect(manager.buildAppleScriptString('/Users/x/a\\b "c"')).toBe('"/Users/x/a\\\\b \\"c\\""');
+      expect(manager.buildAppleScriptString('/Users/x/项目')).toBe('"/Users/x/项目"');
+    });
+  });
+
+  describe('osascript-backed actions', () => {
+    beforeEach(() => {
+      Object.defineProperty(process, 'platform', { value: 'darwin', configurable: true });
+      manager.register('proj', '/Users/test/proj');
+    });
+
+    it('writeLine runs osascript via execFile + stdin and returns true on "ok"', async () => {
+      const scripts = mockOsascript();
+      expect(await manager.writeLine('proj', 'hello 😀')).toBe(true);
+      expect(scripts).toHaveLength(1);
+      expect(scripts[0].file).toBe('osascript');
+      expect(scripts[0].args).toEqual(['-']);
+      expect(scripts[0].script).toContain('input text "hello " & (character id 128512) to foundTerm');
+      expect(scripts[0].script.trim().endsWith('return "ok"')).toBe(true);
+    });
+
+    it('selects the terminal by cwd and refuses an ambiguous match', async () => {
+      const scripts = mockOsascript();
+      await manager.write('proj', 'x');
+      expect(scripts[0].script).toContain('set targetCwd to "/Users/test/proj"');
+      expect(scripts[0].script).toContain('if matchCount > 1 then error "ambiguous: " & matchCount & " Ghostty terminals in " & targetCwd');
+    });
+
+    it('writeLine/sendKey/write return false (not true) when osascript fails', async () => {
+      const err = new Error('Command failed: osascript -');
+      mockOsascript({ error: err, stdout: '', stderr: 'execution error: ambiguous: 2 Ghostty terminals in /Users/test/proj (-2700)' });
+      expect(await manager.writeLine('proj', 'hello')).toBe(false);
+      expect(manager.lastError).toContain('ambiguous: 2 Ghostty terminals in /Users/test/proj');
+      expect(await manager.sendKey('proj', 'C-u')).toBe(false);
+      expect(await manager.sendKey('proj', 'Enter')).toBe(false);
+      expect(await manager.sendKey('proj', 'Down')).toBe(false);
+      expect(await manager.write('proj', 'x')).toBe(false);
+      expect(await manager.interrupt('proj')).toBe(false);
+    });
+
+    it('returns false when osascript exits 0 without completing the script', async () => {
+      mockOsascript({ stdout: '' });
+      expect(await manager.writeLine('proj', 'hello')).toBe(false);
+      expect(await manager.sendKey('proj', 'C-c')).toBe(false);
+    });
+
+    it('hasTerminal reports a closed tab (no matching terminal) as not alive', async () => {
+      mockOsascript({ error: new Error('failed'), stdout: '', stderr: 'execution error: No Ghostty terminal found for cwd: /Users/test/proj (-2700)' });
+      expect(await manager.hasTerminal('proj')).toBe(false);
+      mockOsascript();
+      expect(await manager.hasTerminal('proj')).toBe(true);
+      expect(await manager.hasTerminal('unregistered')).toBe(false);
+    });
+
+    it('openNewTab escapes the cwd and returns false on failure', async () => {
+      const scripts = mockOsascript();
+      expect(await manager.openNewTab('/Users/x/a\\b', 'claude')).toBe(true);
+      expect(scripts[0].script).toContain('quoted form of "/Users/x/a\\\\b"');
+      mockOsascript({ error: new Error('failed'), stdout: '' });
+      expect(await manager.openNewTab('/Users/x/a', 'claude')).toBe(false);
     });
   });
 });
