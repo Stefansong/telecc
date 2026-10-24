@@ -130,6 +130,40 @@ describe('remote-state', () => {
     expect(rs.isRemoteDriven('/proj/a')).toBe(false);
   });
 
+  it('two Claude sessions in one directory do not interfere (desktop + tmux)', async () => {
+    vi.useFakeTimers();
+    const rs = await import('../src/utils/remote-state.js');
+    const dir = '/proj/a';
+    rs.markRemoteInjected(dir, '修好了吗');                       // bot injects into the tmux Claude
+    expect(rs.classifyPrompt(dir, '修好了吗', 'tmux-sid')).toBe('remote');
+    expect(rs.isRemoteDriven(dir, 'tmux-sid')).toBe(true);
+
+    vi.advanceTimersByTime(3 * 60 * 1000);
+    // meanwhile the user types in the desktop-app session of the same project
+    expect(rs.classifyPrompt(dir, 'local question', 'desk-sid')).toBe('local');
+    expect(rs.isRemoteDriven(dir, 'desk-sid')).toBe(false);     // desktop prompts stay local
+    expect(rs.isRemoteDriven(dir, 'tmux-sid')).toBe(true);      // tmux turn untouched
+    expect(rs.isLocallyActive(dir, 'desk-sid')).toBe(true);
+    expect(rs.isLocallyActive(dir, 'tmux-sid')).toBe(false);    // desktop typing can't silence tmux replies
+
+    rs.endRemoteTurn(dir, 'desk-sid');                           // desktop Stop ends only its own turn
+    expect(rs.isRemoteDriven(dir, 'tmux-sid')).toBe(true);
+    rs.endRemoteTurn(dir, 'tmux-sid');                           // tmux Stop → its reply was sent → done
+    expect(rs.isRemoteDriven(dir, 'tmux-sid')).toBe(false);
+  });
+
+  it('migrates the old single activeAt format', async () => {
+    const fs = await import('fs');
+    const rs = await import('../src/utils/remote-state.js');
+    const file = path.join(dataDir, 'remote-active.json');
+    const k = fs.realpathSync.native(path.resolve('/')).replace(/\/$/, '') + '/proj/legacy';
+    fs.writeFileSync(file, JSON.stringify({ [k]: { pending: [], activeAt: Date.now() } }));
+    expect(rs.isRemoteDriven('/proj/legacy')).toBe(true);
+    expect(rs.isRemoteDriven('/proj/legacy', 'any-sid')).toBe(true);
+    rs.endRemoteTurn('/proj/legacy', 'any-sid');
+    expect(rs.isRemoteDriven('/proj/legacy')).toBe(false);
+  });
+
   it('unmarkRemoteInjected forgets a failed injection', async () => {
     const rs = await import('../src/utils/remote-state.js');
     rs.markRemoteInjected('/proj/a', 'x');

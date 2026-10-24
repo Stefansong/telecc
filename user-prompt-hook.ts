@@ -49,7 +49,7 @@ async function main(): Promise<void> {
 
   let kind: 'remote' | 'local' = 'local';
   try {
-    kind = classifyPrompt(dir, prompt);
+    kind = classifyPrompt(dir, prompt, payload.session_id as string | undefined);
   } catch (err: unknown) {
     logErr('user-prompt-hook', `classifyPrompt failed: ${(err as Error).message}`);
   }

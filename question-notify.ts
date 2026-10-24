@@ -75,7 +75,7 @@ async function main(): Promise<void> {
   // User is working in this session at the terminal and the turn didn't come from
   // Telegram — let Claude Code show its native UI. Telegram-driven questions must go
   // back to Telegram.
-  if (shouldDeferToTerminal(dir)) {
+  if (shouldDeferToTerminal(dir, { sessionId: payload.session_id as string | undefined })) {
     return;
   }
 

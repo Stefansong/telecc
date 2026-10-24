@@ -70,7 +70,7 @@ async function main(): Promise<void> {
   // Telegram → exit without a decision so Claude Code shows its own permission UI.
   // Otherwise (remote-driven, or user away > threshold) Telegram handles it so Claude
   // isn't left stuck waiting with no way to respond.
-  if (shouldDeferToTerminal(dir)) {
+  if (shouldDeferToTerminal(dir, { sessionId: payload.session_id as string | undefined })) {
     debugLog(`[skip] User is active in this session at the terminal — deferring to Claude Code's own permission UI`);
     return;
   }

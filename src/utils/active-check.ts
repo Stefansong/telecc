@@ -5,8 +5,8 @@
  * Per-session via remote-state, keyed by the session's PROJECT ROOT — pass
  * `hookProjectDir(payload.cwd)`, never the raw payload cwd (it changes when Claude
  * `cd`s into a subdirectory):
- *  - isRemoteDriven(dir): the current turn was injected from Telegram → always Telegram
- *  - isLocallyActive(dir): the user typed into THIS session within the threshold
+ *  - isRemoteDriven(dir, sessionId): this session's turn was injected from Telegram → always Telegram
+ *  - isLocallyActive(dir, sessionId): the user typed into THIS session within the threshold
  *    (default 300 s, ACTIVE_THRESHOLD_SECONDS) → the terminal handles it
  *
  * `src/data/typing-active` carries no routing meaning any more — it is only the bot's
@@ -24,8 +24,12 @@ export { isRemoteDriven, isLocallyActive, hookProjectDir };
  * locally and the current turn did not come from Telegram. Otherwise the hook routes
  * it to Telegram.
  */
-export function shouldDeferToTerminal(dir: string, thresholdSeconds?: number): boolean {
-  return !isRemoteDriven(dir) && isLocallyActive(dir, thresholdSeconds);
+export function shouldDeferToTerminal(
+  dir: string,
+  opts?: { sessionId?: string | null; thresholdSeconds?: number } | number,
+): boolean {
+  const o = typeof opts === 'number' ? { thresholdSeconds: opts } : (opts || {});
+  return !isRemoteDriven(dir, o.sessionId) && isLocallyActive(dir, o.sessionId ?? undefined, o.thresholdSeconds);
 }
 
 const LAST_MSG_FILE = '/tmp/claude_last_msg_time';

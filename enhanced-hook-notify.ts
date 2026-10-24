@@ -107,9 +107,9 @@ async function main(): Promise<void> {
 
   // Was the current turn of THIS session injected from Telegram? Read before clearing.
   let remote = false;
-  try { remote = isRemoteDriven(dir); } catch {}
+  try { remote = isRemoteDriven(dir, sessionId); } catch {}
   if (ENDS_REMOTE_TURN.has(STATUS_ARG) && !claudeStillRunning) {
-    try { endRemoteTurn(dir); } catch (err: unknown) {
+    try { endRemoteTurn(dir, sessionId); } catch (err: unknown) {
       logger.error(`Failed to end remote turn: ${(err as Error).message}`);
     }
   }
@@ -160,7 +160,7 @@ async function main(): Promise<void> {
 
   // Suppress if the user is working in THIS session at the terminal, unless the turn
   // was injected from Telegram (then the result must go back to Telegram).
-  if (!config.alwaysNotify && !remote && isLocallyActive(dir)) {
+  if (!config.alwaysNotify && !remote && isLocallyActive(dir, sessionId ?? undefined)) {
     return;
   }
 

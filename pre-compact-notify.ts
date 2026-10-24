@@ -59,7 +59,7 @@ async function main(): Promise<void> {
 
   // User is working in this session at the terminal and the turn didn't come from
   // Telegram — let compaction proceed automatically.
-  if (shouldDeferToTerminal(dir)) {
+  if (shouldDeferToTerminal(dir, { sessionId: payload.session_id as string | undefined })) {
     return;
   }
 

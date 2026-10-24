@@ -53,7 +53,7 @@ async function main(): Promise<void> {
 
   // User is working in this session at the terminal and the turn didn't come from
   // Telegram — they can see the denial locally.
-  if (shouldDeferToTerminal(dir)) {
+  if (shouldDeferToTerminal(dir, { sessionId: payload.session_id as string | undefined })) {
     return;
   }
 
