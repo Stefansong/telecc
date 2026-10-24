@@ -579,3 +579,54 @@ describe('state file safety', () => {
     expect(router.listActiveSessions()).toEqual([]);
   });
 });
+
+describe('external (desktop app) sessions', () => {
+  function seed(map) { router.writeSessionMap(map); }
+  const now = Math.floor(Date.now() / 1000);
+  const base = (over) => ({
+    type: 'tmux', createdAt: now, expiresAt: now + 86400,
+    cwd: '/home/user/projects/proj', tmuxSession: 'external-proj', description: 'completed - proj', ...over,
+  });
+
+  it('classifies sessionType external and legacy entries without sessionType as external', () => {
+    expect(router.isExternalEntry({ sessionType: 'external' })).toBe(true);
+    expect(router.isExternalEntry({ type: 'tmux' })).toBe(true);
+    expect(router.isExternalEntry({ sessionType: 'tmux' })).toBe(false);
+    expect(router.isTmuxEntry({ type: 'tmux' })).toBe(false);
+    expect(router.isControllable({ sessionType: 'pty' })).toBe(true);
+    expect(router.isControllable({ sessionType: 'external' })).toBe(false);
+  });
+
+  it('lists and resolves a desktop session even though no tmux server is running', () => {
+    seed({ D1: base({ sessionType: 'external' }) });
+    expect(router.listActiveSessions().map(s => s.workspace)).toEqual(['proj']);
+    const r = router.resolveWorkspace('proj', { allowPrefix: false });
+    expect(r.type).toBe('exact');
+    expect(r.match.session.sessionType).toBe('external');
+  });
+
+  it('prefers a live controllable session over a newer desktop session in the same project', () => {
+    seed({
+      D1: base({ sessionType: 'external', createdAt: now }),
+      P1: base({ sessionType: 'pty', tmuxSession: 'proj', createdAt: now - 600 }),
+    });
+    expect(router.resolveWorkspace('proj').match.session.sessionType).toBe('pty');
+    expect(router.listActiveSessions()[0].session.sessionType).toBe('pty');
+  });
+
+  it('upsertSession stores external and keeps it apart from the tmux entry for the same cwd', () => {
+    router.upsertSession({ cwd: '/home/user/projects/proj', tmuxSession: 'external-proj', status: 'completed', sessionType: 'external', sessionId: 'sid-ext' });
+    router.upsertSession({ cwd: '/home/user/projects/proj', tmuxSession: 'proj', status: 'starting', sessionType: 'pty', sessionId: 'sid-pty' });
+    const entries = Object.values(router.readSessionMap());
+    expect(entries).toHaveLength(2);
+    expect(entries.find(e => e.sessionType === 'external').type).toBe('external');
+    expect(router.resolveWorkspace('proj').match.session.sessionId).toBe('sid-pty');
+  });
+
+  it('drops Ghostty entries when the Ghostty app is not running', () => {
+    // In the test environment Ghostty is not running (pgrep finds nothing)
+    seed({ G1: base({ sessionType: 'ghostty', tmuxSession: 'proj' }) });
+    expect(router.listActiveSessions()).toEqual([]);
+    expect(router.resolveWorkspace('proj').type).toBe('none');
+  });
+});

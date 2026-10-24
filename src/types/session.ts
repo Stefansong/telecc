@@ -18,8 +18,13 @@ export interface RateLimitInfo {
 
 export interface SessionEntry {
   type: string;
-  /** Actual session mode — absent means 'tmux' for backwards compatibility */
-  sessionType?: 'tmux' | 'pty' | 'ghostty';
+  /**
+   * Where Claude runs. 'external' = a terminal the bot can't type into (Claude
+   * desktop app, Terminal.app, VS Code...): visible in /sessions and reachable via
+   * /resume into tmux, never an injection target. Absent = legacy entry, treated as
+   * external (hooks always set it now).
+   */
+  sessionType?: 'tmux' | 'pty' | 'ghostty' | 'external';
   /** Unix timestamp in SECONDS */
   createdAt: number;
   /** Unix timestamp in SECONDS */

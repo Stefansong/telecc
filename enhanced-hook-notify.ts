@@ -131,13 +131,17 @@ async function main(): Promise<void> {
   // Update session map (skip for session-end — session is over)
   if (config.upsertSession) {
     try {
-      const sessionType: 'tmux' | 'ghostty' | undefined =
+      const sessionType: 'tmux' | 'ghostty' | 'external' =
         process.env.TMUX ? 'tmux'
         : process.env.TERM_PROGRAM === 'ghostty' ? 'ghostty'
-        : undefined;
+        : 'external';
       upsertSession({
         cwd: dir,
-        tmuxSession: tmuxSession || `claude-${workspace}`,
+        // External terminals get their own key so they never share (and flip-flop)
+        // a map entry with the tmux session the bot may start for the same project.
+        tmuxSession: sessionType === 'external'
+          ? `external-${tmuxSession || workspace}`
+          : (tmuxSession || `claude-${workspace}`),
         tmuxPane: process.env.TMUX ? process.env.TMUX_PANE : undefined,
         status: STATUS_ARG,
         sessionId,

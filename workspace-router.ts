@@ -78,7 +78,59 @@ function isEnded(session: SessionEntry | Record<string, unknown>): boolean {
 }
 
 function isTmuxEntry(session: SessionEntry): boolean {
-  return session.type === 'tmux' || session.sessionType === 'tmux';
+  return session.sessionType === 'tmux';
+}
+
+function isGhosttyEntry(session: SessionEntry): boolean {
+  return session.sessionType === 'ghostty';
+}
+
+/**
+ * A terminal the bot can't type into (Claude desktop app, Terminal.app, VS Code...).
+ * Hooks mark these 'external'; entries without a sessionType predate that and were
+ * only ever written by hooks running outside tmux/Ghostty, so they're external too.
+ */
+function isExternalEntry(session: SessionEntry): boolean {
+  return session.sessionType === 'external' || session.sessionType === undefined;
+}
+
+/** Can the bot inject text into this session (if it's alive)? */
+function isControllable(session: SessionEntry): boolean {
+  return !isExternalEntry(session);
+}
+
+/** Is the Ghostty app running? null when that can't be determined. */
+function ghosttyRunning(): boolean | null {
+  try {
+    execFileSync('pgrep', ['-x', 'Ghostty'], { stdio: ['ignore', 'pipe', 'ignore'], timeout: 2000 });
+    return true;
+  } catch (err: unknown) {
+    const e = err as NodeJS.ErrnoException & { status?: number; signal?: string };
+    if (e && e.status === 1) return false; // pgrep: no match
+    return null;
+  }
+}
+
+/** Lazily-evaluated Ghostty liveness: an entry can't be alive if the app isn't running. */
+function ghosttyLivenessFilter(): (session: SessionEntry) => boolean {
+  let running: boolean | null | undefined;
+  return (session: SessionEntry) => {
+    if (!isGhosttyEntry(session)) return true;
+    if (running === undefined) running = ghosttyRunning();
+    return running !== false;
+  };
+}
+
+/**
+ * Pick the entry to show/route for a workspace: a live controllable session beats an
+ * external one (the desktop window and the tmux session the bot started for the same
+ * project can both exist); within the same class the newest wins.
+ */
+function preferSession(a: SessionEntry, b: SessionEntry): boolean {
+  const ra = isControllable(a) ? 1 : 0;
+  const rb = isControllable(b) ? 1 : 0;
+  if (ra !== rb) return ra > rb;
+  return a.createdAt > b.createdAt;
 }
 
 /**
@@ -156,18 +208,19 @@ function listActiveSessions(): Array<{ workspace: string; token: string; session
   // entries pointing at panes the user has since closed. Without this, /sessions
   // reports zombies that silently fail when /<workspace> tries to send_keys.
   const isLive = tmuxLivenessFilter();
+  const ghosttyLive = ghosttyLivenessFilter();
 
-  // Keep only the most recent session per workspace
+  // One entry per workspace: live controllable first, then newest (see preferSession)
   const byWorkspace = new Map<string, { token: string; session: SessionEntry }>();
 
   for (const [token, session] of Object.entries(map)) {
     if (isExpired(session) || isEnded(session)) continue;
-    // Fork patch: drop dead tmux entries
-    if (!isLive(session)) continue;
+    // Fork patch: drop dead tmux / Ghostty entries
+    if (!isLive(session) || !ghosttyLive(session)) continue;
     const workspace = extractWorkspaceName(session.cwd) || 'unknown';
 
     const existing = byWorkspace.get(workspace);
-    if (!existing || session.createdAt > existing.session.createdAt) {
+    if (!existing || preferSession(session, existing.session)) {
       byWorkspace.set(workspace, { token, session });
     }
   }
@@ -196,7 +249,7 @@ function upsertSessionUnlocked({ cwd, tmuxSession, status, sessionId, sessionTyp
   tmuxSession: string;
   status: string;
   sessionId?: string | null;
-  sessionType?: 'tmux' | 'pty' | 'ghostty';
+  sessionType?: 'tmux' | 'pty' | 'ghostty' | 'external';
   rateLimit?: RateLimitInfo;
   tmuxPane?: string;
 }): { token: string; workspace: string | null } {
@@ -228,7 +281,7 @@ function upsertSessionUnlocked({ cwd, tmuxSession, status, sessionId, sessionTyp
   // Built fresh (no spread of `existing`), so a previous endedAt is cleared:
   // a hook firing for this cwd means the session is alive again.
   map[token] = {
-    type: resolvedSessionType || 'tmux',
+    type: resolvedSessionType || 'external',
     ...(resolvedSessionType !== undefined ? { sessionType: resolvedSessionType } : {}),
     createdAt: existing ? existing.createdAt : now,
     expiresAt,
@@ -370,17 +423,18 @@ function resolveWorkspace(name: string, opts: { allowPrefix?: boolean } = {}): R
   // Fork patch: same tmux liveness check as listActiveSessions, so we don't route
   // /<workspace> commands to a pane the user already closed.
   const isLive = tmuxLivenessFilter();
+  const ghosttyLive = ghosttyLivenessFilter();
 
-  // Build deduplicated workspace → { token, session } map (newest wins)
+  // Build deduplicated workspace → { token, session } map (see preferSession)
   const byWorkspace = new Map<string, { workspace: string; token: string; session: SessionEntry }>();
   for (const [token, session] of Object.entries(map)) {
     if (isExpired(session) || isEnded(session)) continue;
-    // Fork patch: drop dead tmux entries
-    if (!isLive(session)) continue;
+    // Fork patch: drop dead tmux / Ghostty entries
+    if (!isLive(session) || !ghosttyLive(session)) continue;
     const ws = extractWorkspaceName(session.cwd);
     if (!ws) continue;
     const existing = byWorkspace.get(ws.toLowerCase());
-    if (!existing || session.createdAt > existing.session.createdAt) {
+    if (!existing || preferSession(session, existing.session)) {
       byWorkspace.set(ws.toLowerCase(), { workspace: ws, token, session });
     }
   }
@@ -756,6 +810,10 @@ export {
   pruneExpired,
   isExpired,
   isEnded,
+  isTmuxEntry,
+  isGhosttyEntry,
+  isExternalEntry,
+  isControllable,
   getDefaultWorkspace,
   setDefaultWorkspace,
   trackNotificationMessage,

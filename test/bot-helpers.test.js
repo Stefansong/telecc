@@ -106,7 +106,7 @@ describe('menu callback keys', () => {
       path: '/Users/someone/项目/' + '很长的路径'.repeat(20),
       sessionId: '0c9a7c4e-3b1a-4d5e-9f00-1234567890ab',
     };
-    for (const kind of ['new', 'rp', 'rs', 'rc']) {
+    for (const kind of ['new', 'rp', 'rs', 'rc', 'rpall']) {
       const data = bot.encodeMenuCallback(kind, bot.menuKeyFor(payload));
       expect(Buffer.byteLength(data, 'utf8')).toBeLessThanOrEqual(64);
       expect(bot.parseMenuCallback(data)).toEqual({ kind, key: bot.menuKeyFor(payload) });

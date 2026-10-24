@@ -34,6 +34,9 @@ import { execFile, execFileSync } from 'child_process';
 import {
   resolveWorkspace,
   listActiveSessions,
+  isTmuxEntry,
+  isGhosttyEntry,
+  isExternalEntry,
   readSessionMap,
   updateSessionMap,
   pruneExpired,
@@ -138,7 +141,40 @@ const LONG_POLL_TIMEOUT_S = 30;
 
 // ── Telegram API helpers ────────────────────────────────────────
 
-function telegramAPI(method: string, body: Record<string, unknown>): Promise<unknown> {
+const TRANSIENT_NET_ERROR = /ENOTFOUND|EAI_AGAIN|ECONNRESET|ECONNREFUSED|ETIMEDOUT|EPIPE|EHOSTUNREACH|ENETUNREACH|ENETDOWN|socket hang up|socket disconnected|timed out|deadline|closed before|aborted|Too Many Requests|Bad Gateway|Gateway Timeout|Service Unavailable/i;
+const SEND_RETRY_DELAYS_MS = [1500, 4000, 8000];
+
+/**
+ * Telegram call with retries for transient network failures. A reply goes out over a
+ * fresh TLS connection, which fails for a few seconds after sleep/wake or a VPN flap
+ * while the already-established long-poll connection keeps receiving — without
+ * retries the bot "hears" the user but its answers vanish. getUpdates is not retried
+ * here; the poll loop has its own backoff.
+ */
+async function telegramAPI(method: string, body: Record<string, unknown>): Promise<unknown> {
+  if (method === 'getUpdates') return telegramRequest(method, body);
+  let attempt = 0;
+  for (;;) {
+    try {
+      const result = await telegramRequest(method, body);
+      if (method === 'sendMessage') {
+        logger.info(`Sent: ${String(body.text ?? '').replace(/\s+/g, ' ').slice(0, 80)}`);
+      }
+      return result;
+    } catch (err: unknown) {
+      const msg = (err as Error).message;
+      if (!TRANSIENT_NET_ERROR.test(msg) || attempt >= SEND_RETRY_DELAYS_MS.length) {
+        logger.error(`Telegram ${method} failed${attempt ? ` after ${attempt + 1} attempts` : ''}: ${msg}`);
+        throw err;
+      }
+      const delay = SEND_RETRY_DELAYS_MS[attempt++];
+      logger.warn(`Telegram ${method} failed (${msg}) — retrying in ${delay / 1000}s`);
+      await sleep(delay);
+    }
+  }
+}
+
+function telegramRequest(method: string, body: Record<string, unknown>): Promise<unknown> {
   return new Promise((resolve, reject) => {
     const payload: string = JSON.stringify(body);
     const isLongPoll = method === 'getUpdates';
@@ -495,7 +531,7 @@ export function tailText(text: string, maxChars: number): string {
 // project names. Menu buttons now carry a fixed-size key that maps to the full
 // payload; the map is cached in memory and persisted so buttons survive restarts.
 
-export type MenuKind = 'new' | 'rp' | 'rs' | 'rc';
+export type MenuKind = 'new' | 'rp' | 'rs' | 'rc' | 'rpall';
 
 export interface MenuPayload {
   name: string;
@@ -527,7 +563,7 @@ export function encodeMenuCallback(kind: MenuKind, key: string): string {
 }
 
 export function parseMenuCallback(data: string): { kind: MenuKind; key: string } | null {
-  const m = /^(new|rp|rs|rc):#([0-9a-f]{10})$/.exec(data);
+  const m = /^(new|rp|rs|rc|rpall):#([0-9a-f]{10})$/.exec(data);
   return m ? { kind: m[1] as MenuKind, key: m[2] } : null;
 }
 
@@ -607,11 +643,11 @@ async function handleHelp(): Promise<void> {
     '`/use clear` — Clear default',
     '`/compact [workspace]` — Compact context in workspace',
     '`/new [project]` — Start Claude in a project (shows recent if no arg)',
-    '`/resume [project]` — Resume a past Claude conversation',
+    '`/resume [project]` — Switch conversation (current project; tap *Other projects* to switch project)',
     '`/link <prompt>` — Generate deep link to open Claude',
     '`/effort [workspace] low|medium|high` — Set thinking effort',
     '`/model [workspace] <model>` — Switch Claude model',
-    '`/sessions` — List active sessions',
+    '`/sessions` — List sessions (\u{1F4BB} = Claude desktop app / plain terminal: read-only here, /resume to continue)',
     '`/status [workspace]` — Show tmux output',
     '`/stop [workspace]` — Interrupt running prompt',
     '`/cmd <TOKEN> <command>` — Token-based fallback',
@@ -781,11 +817,14 @@ async function handleClear(removeAll: boolean): Promise<void> {
   const remaining = updateSessionMap((map) => {
     const kept: typeof map = {};
     for (const [token, s] of Object.entries(map)) {
-      const isTmux = (s.type === 'tmux' || (s as any).sessionType === 'tmux');
-      const isGhostty = (s.type === 'ghostty' || (s as any).sessionType === 'ghostty');
+      const isTmux = isTmuxEntry(s);
+      const isGhostty = isGhosttyEntry(s);
+      // External (desktop app) sessions have no liveness probe: only prune them once ended
+      const isExternal = isExternalEntry(s);
       const tmuxDead = isTmux && !!s.tmuxSession && liveTmux !== null && !liveTmux.has(s.tmuxSession);
       const ghosttyDead = isGhostty && !!s.cwd && liveGhosttyCwds !== null && !liveGhosttyCwds.has(normalizeDir(s.cwd));
       const completedAndDead =
+        !isExternal &&
         (s.description || '').startsWith('completed') &&
         (!isTmux || tmuxDead) &&
         (!isGhostty || ghosttyDead);
@@ -895,9 +934,12 @@ async function handleSessions(): Promise<void> {
   });
 
   let footer = '';
+  if (sessions.some(s => isExternalEntry(s.session))) {
+    footer += '\n\n\u{1F4BB} _= Claude desktop app / plain terminal: Telegram can\'t type into it. Use /resume to continue it here._';
+  }
   const defaultWs: string | null = getDefaultWorkspace();
   if (defaultWs) {
-    footer = `\n\n_Default workspace:_ *${escapeMarkdown(defaultWs)}*`;
+    footer += `\n\n_Default workspace:_ *${escapeMarkdown(defaultWs)}*`;
   }
 
   await sendMessage(`*Active Sessions*\n\n${lines.join('\n')}${footer}`);
@@ -944,7 +986,7 @@ async function handleStatus(workspaceArg: string | null): Promise<void> {
   // skip the pane capture and rely on the transcript's last assistant message.
   const useGhostty = (isGhosttySession(session) || ghosttySessionManager.has(tmuxName));
   let paneOutput: string | null = null;
-  if (!useGhostty) {
+  if (!useGhostty && !isExternalEntry(session)) {
     try {
       const raw = await sessionCaptureOutput(tmuxName, session);
       paneOutput = raw.trim().split('\n').slice(-20).join('\n');
@@ -972,6 +1014,9 @@ function buildStatusMessage(
 ): string {
   const lines: string[] = [];
   lines.push(`\u{1F4CA} <b>${escapeHtml(workspace)}</b>`);
+  if (isExternalEntry(session)) {
+    lines.push('\u{1F4BB} <i>Runs in the Claude desktop app / a plain terminal \u2014 read-only from Telegram. Use /resume to continue it here.</i>');
+  }
 
   // Model + version
   if (transcript?.model) {
@@ -1097,6 +1142,11 @@ async function handleStop(workspaceArg: string | null): Promise<void> {
   const resolvedName: string = resolved.workspace;
   const tmuxName: string = resolved.match.session.tmuxSession;
 
+  if (isExternalEntry(resolved.match.session)) {
+    await sendExternalSessionNotice(resolvedName, resolved.match.session);
+    return;
+  }
+
   if (!await sessionExists(tmuxName, resolved.match.session)) {
     await sendMessage(`Session *${escapeMarkdown(tmuxName)}* not found.`);
     return;
@@ -1145,6 +1195,7 @@ async function handleWorkspaceCommand(workspace: string, command: string, allowP
     return;
   }
 
+  logger.info(`Routing to ${resolved.workspace} [${resolved.match.session.sessionType ?? 'legacy'}:${resolved.match.session.tmuxSession}]`);
   await injectAndRespond(resolved.match.session, command, resolved.workspace);
 }
 
@@ -1523,6 +1574,11 @@ async function handleResume(nameArg: string | null): Promise<void> {
     return;
   }
 
+  await showAllProjectsPicker();
+}
+
+/** `/resume` across every project with history: pick a project, then a conversation. */
+async function showAllProjectsPicker(): Promise<void> {
   const allProjects = getRecentProjects(50);
   const projects = allProjects
     .map(p => ({ ...p, sessions: getClaudeSessionsForProject(p.path, 1) }))
@@ -1571,9 +1627,12 @@ async function resumeProject(projectName: string, knownPath?: string): Promise<v
   const sessions = getClaudeSessionsForProject(project.path, 5);
 
   if (sessions.length === 0) {
-    await sendMessage(
-      `No sessions found for \`${escapeMarkdown(projectName)}\`.\n\nUse /new to start one.`
-    );
+    await telegramAPI('sendMessage', {
+      chat_id: CHAT_ID,
+      text: `No conversations found for \`${escapeMarkdown(projectName)}\`.\n\nUse /new to start one, or pick another project:`,
+      parse_mode: 'Markdown',
+      reply_markup: { inline_keyboard: [[otherProjectsButton()]] },
+    });
     return;
   }
 
@@ -1585,12 +1644,40 @@ async function resumeProject(projectName: string, knownPath?: string): Promise<v
     payload: { name: project.name, path: project.path, sessionId: s.id },
   })));
   const keyboard: Array<Array<{ text: string; callback_data: string }>> = buttons.map(b => [b]);
+  // The picker is scoped to one project — one tap to switch project instead of /use clear
+  keyboard.push([otherProjectsButton()]);
 
   await telegramAPI('sendMessage', {
     chat_id: CHAT_ID,
     text: `*Resume: ${escapeMarkdown(projectName)}*\n\nChoose a conversation:`,
     parse_mode: 'Markdown',
     reply_markup: { inline_keyboard: keyboard },
+  });
+}
+
+function otherProjectsButton(): { text: string; callback_data: string } {
+  return menuButton('rpall', '\u{1F4C2} Other projects', { name: '*' });
+}
+
+/**
+ * The session lives in a terminal the bot can't type into (Claude desktop app, plain
+ * Terminal.app, VS Code...). Explain, and offer to continue the same conversation in a
+ * tmux session the bot owns.
+ */
+async function sendExternalSessionNotice(workspace: string, session: SessionEntry): Promise<void> {
+  const name = path.basename(session.cwd) || workspace;
+  const rows: Array<Array<{ text: string; callback_data: string }>> = [];
+  if (session.sessionId && isValidSessionId(session.sessionId)) {
+    rows.push([menuButton('rs', '\u25b6\ufe0f Continue this conversation here', { name, path: session.cwd, sessionId: session.sessionId })]);
+  }
+  rows.push([menuButton('rp', '\u{1F4C2} Pick another conversation', { name, path: session.cwd })]);
+  await telegramAPI('sendMessage', {
+    chat_id: CHAT_ID,
+    text: `\u{1F4BB} *${escapeMarkdown(workspace)}* is running in the Claude desktop app (or a plain terminal), which Telegram can't type into.\n\n` +
+      `To keep working from your phone, continue the conversation in a background session managed by the bot.\n\n` +
+      `_Your desktop window won't show messages sent from here \u2014 don't type in both at once._`,
+    parse_mode: 'Markdown',
+    reply_markup: { inline_keyboard: rows },
   });
 }
 
@@ -1662,10 +1749,9 @@ async function resumeSession(projectName: string, projectPath: string, sessionId
     if (age < activeThresholdMs) {
       await telegramAPI('sendMessage', {
         chat_id: CHAT_ID,
-        text: `\u26a0\ufe0f This session appears to be *active* (last activity ${formatSessionAge(lastActivity)})\n\n` +
-          `Claude Code may be running in a terminal. ` +
-          `Resuming the same session in two places can cause conflicts.\n\n` +
-          `_If you just finished this session, you can safely resume._`,
+        text: `\u26a0\ufe0f This conversation was *active ${formatSessionAge(lastActivity)}* \u2014 probably open in the Claude desktop app or a terminal.\n\n` +
+          `Resuming here starts a second Claude on the same conversation; the other window won't see messages sent from here.\n\n` +
+          `_If you're done there, it's safe to continue here._`,
         parse_mode: 'Markdown',
         reply_markup: {
           inline_keyboard: [[
@@ -1997,6 +2083,12 @@ async function injectAndRespond(
     return false;
   }
 
+  // Claude desktop app / plain terminal: nothing to type into — offer to continue in tmux
+  if (isExternalEntry(session)) {
+    await sendExternalSessionNotice(workspace, session);
+    return false;
+  }
+
   if (!await sessionExists(tmuxName, session)) {
     const ghosttyErr = isGhosttySession(session) ? ghosttySessionManager.lastError : null;
     await sendMessage(ghosttyErr && /ambiguous/i.test(ghosttyErr)
@@ -2043,6 +2135,7 @@ async function injectAndRespond(
       await sleep(150);
       await sendKeys(target, 'Enter');
     }
+    logger.info(`Injected into ${workspace} [${session.sessionType ?? 'tmux'}:${tmuxName}]`);
     startTypingIndicator();
     return true;
   } catch (err: unknown) {
@@ -2139,6 +2232,7 @@ async function sessionInterrupt(name: string, session?: SessionEntry): Promise<v
 
 /** Icon for /sessions listing based on session type and live status. */
 function sessionIcon(s: { workspace: string; token: string; session: SessionEntry; age: string }): string {
+  if (isExternalEntry(s.session)) return '\u{1F4BB}'; // 💻 desktop app / plain terminal
   if (s.session.sessionType === 'ghostty') return '\u{1F47B}'; // 👻
   if (s.session.sessionType === 'pty') {
     return ptySessionManager.has(s.session.tmuxSession) ? '\u{1F916}' : '\u{1F4A4}'; // 🤖 or 💤
@@ -2380,6 +2474,9 @@ async function handleMenuSelection(
     answerCallbackQuery(queryId, `Loading ${name}...`);
     await appendStatus('\u2014 Loading sessions...');
     await runSerialized(() => resumeProject(name, entry.path));
+  } else if (kind === 'rpall') {
+    answerCallbackQuery(queryId, 'Loading projects...');
+    await runSerialized(() => showAllProjectsPicker());
   } else if (entry.path && entry.sessionId) {
     // rs: resume a specific conversation; rc: confirmed (kill active + restart)
     const force = kind === 'rc';
