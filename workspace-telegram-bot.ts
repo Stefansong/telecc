@@ -1715,7 +1715,9 @@ async function resumeSession(projectName: string, projectPath: string, sessionId
   const running = currentEntry
     ? await sessionExists(tmuxName, currentEntry)
     : (isPtySession(tmuxName) || (TMUX_AVAILABLE && await sessionExists(tmuxName)));
-  const botOwnsThisSession = currentEntry?.sessionId === sessionId;
+  // Only a session that still exists counts as "ours": a stale entry left by a tmux
+  // session that was killed without a SessionEnd must not skip the active-elsewhere warning
+  const botOwnsThisSession = running && currentEntry?.sessionId === sessionId;
 
   // Is Claude actually up in that terminal, or did it exit back to the shell?
   let state: ClaudeTerminalState | null = null;
