@@ -13,6 +13,7 @@ import path from 'path';
 import fs from 'fs';
 import { optionalRequire } from './optional-require';
 import { CCGRAM_HOME } from './paths';
+import { childEnv } from './child-env';
 
 // Key name → raw escape sequence (mirrors tmux key names used throughout the bot)
 const KEY_SEQUENCES: Record<string, string> = {
@@ -87,7 +88,7 @@ export class PtySessionManager {
         cols: 220,
         rows: 50,
         cwd,
-        env: { ...process.env },
+        env: childEnv(), // never leak the daemon's own .env (bot token!) into Claude
       });
 
       this.handles.set(name, pty);

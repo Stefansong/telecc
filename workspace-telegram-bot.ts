@@ -69,6 +69,7 @@ import { ghosttySessionManager } from './src/utils/ghostty-session-manager';
 import { generateDeepLink, canGenerateDeepLink } from './src/utils/deep-link';
 import { readTranscriptStatus, type TranscriptStatus } from './src/utils/transcript-reader';
 import {
+  newSession,
   tmux,
   paneTarget,
   resolvePaneTarget,
@@ -1477,7 +1478,7 @@ async function startProject(name: string, knownDir?: string): Promise<void> {
     // tmux path: a login shell runs `claude`, so the user's PATH/rc apply and the
     // pane falls back to a shell (needed for the /resume switch) when Claude exits.
     try {
-      await tmux(['new-session', '-d', '-s', tmuxName, '-c', projectDir]);
+      await newSession(tmuxName, projectDir);
       await sleep(300);
       const target = paneTarget(tmuxName);
       await sendLiteral(target, 'claude');
@@ -1904,7 +1905,7 @@ async function startProjectResume(name: string, projectDir: string, sessionId: s
 
   if (mode === 'tmux') {
     try {
-      await tmux(['new-session', '-d', '-s', tmuxName, '-c', projectDir]);
+      await newSession(tmuxName, projectDir);
       await sleep(300);
       const target = paneTarget(tmuxName);
       await sendLiteral(target, `claude --resume ${sessionId}`);
@@ -1980,8 +1981,11 @@ async function startProjectResume(name: string, projectDir: string, sessionId: s
  * then the newest. Ended entries are kept so /new and /resume can relaunch there.
  */
 function findTrackedSession(tmuxName: string): SessionEntry | undefined {
+  // Only terminals the bot can drive. A desktop-app (external) entry that happens to
+  // share the name must not make the bot think it already owns that conversation —
+  // that skipped the "active elsewhere" warning and started a second Claude on it.
   return Object.values(readSessionMap())
-    .filter(s => s.tmuxSession === tmuxName && !isExpired(s))
+    .filter(s => s.tmuxSession === tmuxName && !isExpired(s) && !isExternalEntry(s))
     .sort((a, b) => Number(!!a.endedAt) - Number(!!b.endedAt) || b.createdAt - a.createdAt)[0];
 }
 

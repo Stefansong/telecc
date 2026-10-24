@@ -11,13 +11,16 @@
  */
 
 import { execFile } from 'child_process';
+import { childEnv, isOwnConfigKey } from './child-env';
 
 const DEFAULT_TIMEOUT_MS = 5000;
 
 /** Run tmux with the given argv; resolves stdout, rejects on non-zero exit/timeout. */
 export function tmux(args: string[], timeoutMs: number = DEFAULT_TIMEOUT_MS): Promise<string> {
   return new Promise((resolve, reject) => {
-    execFile('tmux', args, { encoding: 'utf8', timeout: timeoutMs }, (err, stdout, stderr) => {
+    // Scrubbed env: when this call starts the tmux server, its global environment
+    // (inherited by every pane) must not contain the daemon's secrets
+    execFile('tmux', args, { encoding: 'utf8', timeout: timeoutMs, env: childEnv() }, (err, stdout, stderr) => {
       if (err) {
         const msg = (stderr || '').trim() || err.message;
         reject(new Error(msg));
@@ -26,6 +29,18 @@ export function tmux(args: string[], timeoutMs: number = DEFAULT_TIMEOUT_MS): Pr
       }
     });
   });
+}
+
+/**
+ * Start a detached session for the bot. A server started before env scrubbing existed
+ * may still carry the daemon's keys in its global environment — unset them first so
+ * the new pane's shell (and the Claude + plugins it runs) can't inherit them.
+ */
+export async function newSession(name: string, cwd: string): Promise<void> {
+  for (const key of Object.keys(process.env).filter(isOwnConfigKey)) {
+    try { await tmux(['set-environment', '-gu', key]); } catch { /* no server yet */ }
+  }
+  await tmux(['new-session', '-d', '-s', name, '-c', cwd]);
 }
 
 /** Exact session target (no prefix fallback). */
